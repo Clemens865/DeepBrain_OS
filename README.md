@@ -40,9 +40,9 @@ SuperBrain sits in your menu bar and provides a Spotlight-like overlay (triggere
 | Layer | Technology |
 |-------|-----------|
 | Desktop framework | Tauri 2 |
-| Backend | Rust (tokio, rusqlite, reqwest, notify, dashmap, parking_lot) |
+| Backend | Rust (tokio, rusqlite, reqwest, ort, notify, dashmap, parking_lot) |
 | Frontend | React 18 + TypeScript + Tailwind CSS + Zustand |
-| Embeddings | Hash-based (384-dim) with Ollama fallback |
+| Embeddings | ONNX all-MiniLM-L6-v2 (384-dim) with Ollama + hash fallback |
 | Persistence | SQLite (WAL mode) for memories, Q-table, file index |
 | AI (optional) | Ollama (local) or Claude API (cloud) |
 
@@ -104,7 +104,7 @@ superbrain-app/
 ├── src-tauri/                    # Rust backend
 │   └── src/
 │       ├── main.rs               # Tauri entry, tray, shortcuts, watcher
-│       ├── commands.rs           # 13 IPC command handlers
+│       ├── commands.rs           # 15 IPC command handlers
 │       ├── tray.rs               # System tray + context menu
 │       ├── overlay.rs            # Window show/hide/toggle
 │       ├── state.rs              # AppState: engine + embeddings + persistence
@@ -112,10 +112,11 @@ superbrain-app/
 │       │   ├── cognitive.rs      # CognitiveEngine (think, remember, recall, evolve)
 │       │   ├── memory.rs         # DashMap vector memory with cosine search
 │       │   ├── learning.rs       # Q-Learning + experience replay + meta-learning
-│       │   ├── embeddings.rs     # Hash (384-dim) + Ollama embedding providers
+│       │   ├── embeddings.rs     # ONNX + Ollama + Hash embedding providers
 │       │   ├── persistence.rs    # SQLite storage for memories, Q-table, config
 │       │   ├── types.rs          # Shared type definitions
 │       │   └── utils.rs          # Vector math, similarity, normalization
+│       ├── keychain.rs            # macOS Keychain (Claude API key storage)
 │       ├── ai/
 │       │   ├── mod.rs            # AiProvider trait
 │       │   ├── ollama.rs         # Ollama REST client
@@ -173,7 +174,7 @@ superbrain-app/
 - [x] **Phase 5: OS Integration** — File watcher (notify), chunker (512/128), parser (35+ ext), clipboard context, 4 workflows
 - [x] **Phase 6: Polish** — Zero warnings, 38 tests passing, frontend builds clean
 
-### Recently Added (v0.2.0)
+### v0.2.0
 
 - [x] **AI-Enhanced Think** — Ollama/Claude wired into `think` command with memory context, stores interactions as episodic memories
 - [x] **Recursive File Scanning** — Walks subdirectories (max depth 10), skips node_modules/.git/target/etc.
@@ -181,14 +182,18 @@ superbrain-app/
 - [x] **First-Launch Onboarding** — 3-step wizard: welcome, AI detection (auto-detects Ollama), ready
 - [x] **Dynamic AI Provider** — Settings changes refresh the AI provider without restart
 
+### v0.3.0
+
+- [x] **ONNX Embeddings** — all-MiniLM-L6-v2 (384-dim) auto-downloaded from HuggingFace, priority: ONNX > Ollama > Hash
+- [x] **macOS Keychain** — Claude API key stored in Keychain via `security-framework`, stripped from SQLite
+- [x] **Battery-Aware Throttling** — Cognitive cycle: 60s when plugged in, 300s on battery (`battery` crate)
+- [x] **Auto-Update** — `tauri-plugin-updater` configured with GitHub Releases endpoint
+
 ### Roadmap
 
-- [ ] **ONNX Embeddings** — Load `all-MiniLM-L6-v2` model for true semantic similarity (currently using hash-based)
 - [ ] **Code Signing** — Apple Developer certificate, notarization, DMG packaging
-- [ ] **Auto-Update** — `tauri-plugin-updater` with GitHub Releases backend
-- [ ] **Battery-Aware Throttling** — Reduce cognitive cycle frequency on battery power
-- [ ] **macOS Keychain** — Store Claude API key in Keychain instead of SQLite
 - [ ] **Universal Binary** — arm64 + x86_64 fat binary for Intel Macs
+- [ ] **Onboarding Polish** — Folder picker for indexed directories, custom hotkey binding
 
 ## Privacy
 
