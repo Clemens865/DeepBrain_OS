@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod ai;
+pub mod autostart;
 pub mod brain;
 pub mod commands;
 pub mod context;

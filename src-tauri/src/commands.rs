@@ -18,7 +18,8 @@ pub struct ThinkResponse {
 }
 
 #[tauri::command]
-pub async fn think(input: String, state: State<'_, AppState>) -> Result<ThinkResponse, String> {
+pub async fn think(input: String, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<ThinkResponse, String> {
+    crate::tray::set_status(&app, crate::tray::TrayStatus::Thinking);
     let embedding = state.embeddings.embed(&input).await?;
 
     // Get memory-based response and recall relevant memories
@@ -71,6 +72,7 @@ pub async fn think(input: String, state: State<'_, AppState>) -> Result<ThinkRes
                     Some(0.5),
                 );
 
+                crate::tray::set_status(&app, crate::tray::TrayStatus::Idle);
                 return Ok(ThinkResponse {
                     response: ai_resp.content,
                     confidence: brain_result.confidence,
@@ -83,6 +85,7 @@ pub async fn think(input: String, state: State<'_, AppState>) -> Result<ThinkRes
     }
 
     // Fallback: memory-only response
+    crate::tray::set_status(&app, crate::tray::TrayStatus::Idle);
     Ok(ThinkResponse {
         response: brain_result.response,
         confidence: brain_result.confidence,
@@ -212,6 +215,12 @@ pub fn update_settings(
         }
     } else {
         let _ = crate::keychain::delete_secret("claude_api_key");
+    }
+
+    // Update auto-start login item
+    #[cfg(target_os = "macos")]
+    {
+        let _ = crate::autostart::set_auto_start(settings.auto_start);
     }
 
     *state.settings.write() = settings.clone();

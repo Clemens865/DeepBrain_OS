@@ -1,4 +1,5 @@
 import { useRef, useCallback } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "../store/appStore";
 
 let debounceTimer: ReturnType<typeof setTimeout>;
@@ -30,11 +31,10 @@ export default function SearchBar() {
       if (e.key === "Escape") {
         if (query) {
           clearResults();
+          setQuery("");
         } else {
           // Hide window via Tauri
-          import("@tauri-apps/api/core").then(({ invoke }) => {
-            invoke("plugin:window|hide");
-          });
+          getCurrentWindow().hide();
         }
       } else if (e.key === "Enter" && query.trim()) {
         search(query.trim());

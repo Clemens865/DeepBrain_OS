@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 mod ai;
+mod autostart;
 mod brain;
 mod commands;
 mod context;
@@ -102,6 +103,7 @@ pub fn run() {
                 .state::<AppState>()
                 .persistence
                 .clone();
+            let cycle_handle = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -115,12 +117,34 @@ pub fn run() {
                     };
                     tokio::time::sleep(delay).await;
 
+                    // Show learning status
+                    tray::set_status(&cycle_handle, tray::TrayStatus::Learning);
+
                     // Run a cognitive cycle
                     let _ = engine.cycle();
                     // Periodic flush
                     let nodes = engine.memory.all_nodes();
                     let _ = persistence.store_memories_batch(&nodes);
                     tracing::debug!("Background cycle completed (battery={})", on_battery);
+
+                    tray::set_status(&cycle_handle, tray::TrayStatus::Idle);
+                }
+            });
+
+            // Start clipboard monitoring (poll every 2s)
+            let context_ref = app.state::<AppState>().context.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut last_clipboard = String::new();
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    if let Some(current) = get_clipboard_text() {
+                        let trimmed = current.trim().to_string();
+                        if !trimmed.is_empty() && trimmed != last_clipboard {
+                            last_clipboard = trimmed.clone();
+                            context_ref.record_clipboard(trimmed);
+                            tracing::debug!("Clipboard captured");
+                        }
+                    }
                 }
             });
 
@@ -164,6 +188,20 @@ pub fn run() {
 
 fn main() {
     run();
+}
+
+/// Read the current clipboard text via macOS pasteboard
+fn get_clipboard_text() -> Option<String> {
+    std::process::Command::new("pbpaste")
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                String::from_utf8(out.stdout).ok()
+            } else {
+                None
+            }
+        })
 }
 
 /// Check if the system is running on battery power
