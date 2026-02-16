@@ -111,10 +111,16 @@ impl AppState {
         }
 
         // Load settings
-        let settings = match persistence.load_config("app_settings") {
+        let mut settings: AppSettings = match persistence.load_config("app_settings") {
             Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
             _ => AppSettings::default(),
         };
+
+        // Load Claude API key from Keychain (overrides any value in settings)
+        if let Ok(Some(key)) = crate::keychain::get_secret("claude_api_key") {
+            settings.claude_api_key = Some(key);
+            tracing::info!("Loaded Claude API key from Keychain");
+        }
 
         engine.set_running(true);
 

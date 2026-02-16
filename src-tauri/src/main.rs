@@ -7,6 +7,7 @@ mod brain;
 mod commands;
 mod context;
 mod indexer;
+mod keychain;
 mod overlay;
 mod state;
 mod tray;
@@ -29,6 +30,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Set activation policy to accessory (menu bar only, no dock icon)
             #[cfg(target_os = "macos")]
@@ -90,7 +92,7 @@ pub fn run() {
                 }
             }
 
-            // Start background cognitive cycle task
+            // Start background cognitive cycle task (battery-aware)
             let engine = app
                 .state::<AppState>()
                 .engine
@@ -101,15 +103,23 @@ pub fn run() {
                 .clone();
 
             tauri::async_runtime::spawn(async move {
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
                 loop {
-                    interval.tick().await;
+                    // Check battery state: use longer interval when on battery
+                    let on_battery = is_on_battery();
+                    let delay = if on_battery {
+                        tracing::debug!("On battery — using 5min cycle interval");
+                        tokio::time::Duration::from_secs(300)
+                    } else {
+                        tokio::time::Duration::from_secs(60)
+                    };
+                    tokio::time::sleep(delay).await;
+
                     // Run a cognitive cycle
                     let _ = engine.cycle();
                     // Periodic flush
                     let nodes = engine.memory.all_nodes();
                     let _ = persistence.store_memories_batch(&nodes);
-                    tracing::debug!("Background cycle completed");
+                    tracing::debug!("Background cycle completed (battery={})", on_battery);
                 }
             });
 
@@ -150,4 +160,20 @@ pub fn run() {
 
 fn main() {
     run();
+}
+
+/// Check if the system is running on battery power
+fn is_on_battery() -> bool {
+    let manager = battery::Manager::new();
+    match manager {
+        Ok(manager) => {
+            if let Some(Ok(bat)) = manager.batteries().ok().and_then(|mut b| b.next()) {
+                use battery::State;
+                matches!(bat.state(), State::Discharging)
+            } else {
+                false // No battery = desktop = always plugged in
+            }
+        }
+        Err(_) => false,
+    }
 }

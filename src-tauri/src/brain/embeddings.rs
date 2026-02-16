@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::brain::utils::normalize_vector;
 
 const EMBEDDING_DIM: usize = 384;
+const MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
+const MODEL_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx";
+const TOKENIZER_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
 
 /// Embedding provider type
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,27 +25,47 @@ pub enum EmbeddingProvider {
     Hash,
 }
 
+/// Holds a loaded ONNX session + tokenizer
+struct OnnxSession {
+    session: ort::session::Session,
+    tokenizer: tokenizers::Tokenizer,
+}
+
 /// Embedding model manager
 pub struct EmbeddingModel {
     provider: RwLock<EmbeddingProvider>,
+    onnx_session: parking_lot::Mutex<Option<OnnxSession>>,
     ollama_url: String,
     ollama_model: String,
-    _model_path: Option<PathBuf>,
+    model_dir: PathBuf,
 }
 
 impl EmbeddingModel {
     /// Create a new embedding model (starts with hash fallback, can be upgraded)
     pub fn new() -> Self {
+        let model_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("SuperBrain")
+            .join("models");
+
         Self {
             provider: RwLock::new(EmbeddingProvider::Hash),
+            onnx_session: parking_lot::Mutex::new(None),
             ollama_url: "http://localhost:11434".to_string(),
             ollama_model: "nomic-embed-text".to_string(),
-            _model_path: None,
+            model_dir,
         }
     }
 
-    /// Try to initialize Ollama embeddings
+    /// Try to initialize the best available embedding provider
+    /// Priority: ONNX (local, fast) > Ollama > Hash (fallback)
     pub async fn try_init_ollama(&self) -> bool {
+        // First, try ONNX (best option: fast, offline, semantic)
+        if self.try_init_onnx().await {
+            return true;
+        }
+
+        // Then try Ollama
         let client = reqwest::Client::new();
         let url = format!("{}/api/tags", self.ollama_url);
 
@@ -57,6 +80,108 @@ impl EmbeddingModel {
                 false
             }
         }
+    }
+
+    /// Try to initialize ONNX model (download if needed)
+    async fn try_init_onnx(&self) -> bool {
+        let model_path = self.model_dir.join("model.onnx");
+        let tokenizer_path = self.model_dir.join("tokenizer.json");
+
+        // Download model files if not present
+        if !model_path.exists() || !tokenizer_path.exists() {
+            tracing::info!("ONNX model not found, downloading {}...", MODEL_REPO);
+            if let Err(e) = self.download_model_files().await {
+                tracing::warn!("Failed to download ONNX model: {}", e);
+                return false;
+            }
+        }
+
+        // Load ONNX session
+        match self.load_onnx_session(&model_path, &tokenizer_path) {
+            Ok(session) => {
+                *self.onnx_session.lock() = Some(session);
+                *self.provider.write() = EmbeddingProvider::Onnx;
+                tracing::info!("ONNX embedding model loaded (all-MiniLM-L6-v2)");
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load ONNX model: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Download model and tokenizer files from HuggingFace
+    async fn download_model_files(&self) -> Result<(), String> {
+        std::fs::create_dir_all(&self.model_dir)
+            .map_err(|e| format!("Failed to create model dir: {}", e))?;
+
+        let client = reqwest::Client::new();
+
+        // Download model.onnx (~23MB)
+        let model_path = self.model_dir.join("model.onnx");
+        if !model_path.exists() {
+            tracing::info!("Downloading model.onnx...");
+            let resp = client.get(MODEL_URL)
+                .timeout(std::time::Duration::from_secs(300))
+                .send().await
+                .map_err(|e| format!("Download failed: {}", e))?;
+
+            if !resp.status().is_success() {
+                return Err(format!("Model download returned status: {}", resp.status()));
+            }
+
+            let bytes = resp.bytes().await
+                .map_err(|e| format!("Failed to read model bytes: {}", e))?;
+
+            std::fs::write(&model_path, &bytes)
+                .map_err(|e| format!("Failed to write model file: {}", e))?;
+
+            tracing::info!("Downloaded model.onnx ({:.1}MB)", bytes.len() as f64 / 1_048_576.0);
+        }
+
+        // Download tokenizer.json (~700KB)
+        let tokenizer_path = self.model_dir.join("tokenizer.json");
+        if !tokenizer_path.exists() {
+            tracing::info!("Downloading tokenizer.json...");
+            let resp = client.get(TOKENIZER_URL)
+                .timeout(std::time::Duration::from_secs(30))
+                .send().await
+                .map_err(|e| format!("Download failed: {}", e))?;
+
+            if !resp.status().is_success() {
+                return Err(format!("Tokenizer download returned status: {}", resp.status()));
+            }
+
+            let bytes = resp.bytes().await
+                .map_err(|e| format!("Failed to read tokenizer bytes: {}", e))?;
+
+            std::fs::write(&tokenizer_path, &bytes)
+                .map_err(|e| format!("Failed to write tokenizer file: {}", e))?;
+
+            tracing::info!("Downloaded tokenizer.json");
+        }
+
+        Ok(())
+    }
+
+    /// Load ONNX session and tokenizer from disk
+    fn load_onnx_session(
+        &self,
+        model_path: &std::path::Path,
+        tokenizer_path: &std::path::Path,
+    ) -> Result<OnnxSession, String> {
+        let session = ort::session::Session::builder()
+            .map_err(|e| format!("Failed to create session builder: {}", e))?
+            .with_intra_threads(2)
+            .map_err(|e| format!("Failed to set threads: {}", e))?
+            .commit_from_file(model_path)
+            .map_err(|e| format!("Failed to load ONNX model: {}", e))?;
+
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+
+        Ok(OnnxSession { session, tokenizer })
     }
 
     /// Get current provider type
@@ -144,12 +269,76 @@ impl EmbeddingModel {
         Ok(result)
     }
 
-    /// ONNX embedding (placeholder - loads model on demand)
+    /// ONNX embedding using all-MiniLM-L6-v2
     fn embed_onnx(&self, text: &str) -> Result<Vec<f32>, String> {
-        // ONNX runtime integration is complex and requires model file.
-        // For now, fall back to hash-based embedding with a warning.
-        tracing::warn!("ONNX model not loaded, falling back to hash embeddings");
-        Ok(self.embed_hash(text))
+        let mut session_guard = self.onnx_session.lock();
+        let session = session_guard.as_mut()
+            .ok_or("ONNX session not loaded")?;
+
+        // Tokenize
+        let encoding = session.tokenizer.encode(text, true)
+            .map_err(|e| format!("Tokenization failed: {}", e))?;
+
+        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let attention_mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
+        let token_type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
+        let seq_len = input_ids.len();
+
+        // Create input tensors [1, seq_len]
+        let shape = [1_usize, seq_len];
+        let input_ids_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec(shape, input_ids)
+                .map_err(|e| format!("input_ids shape error: {}", e))?
+        ).map_err(|e| format!("input_ids tensor error: {}", e))?;
+
+        let attention_mask_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec(shape, attention_mask.clone())
+                .map_err(|e| format!("attention_mask shape error: {}", e))?
+        ).map_err(|e| format!("attention_mask tensor error: {}", e))?;
+
+        let token_type_ids_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec(shape, token_type_ids)
+                .map_err(|e| format!("token_type_ids shape error: {}", e))?
+        ).map_err(|e| format!("token_type_ids tensor error: {}", e))?;
+
+        // Run inference
+        let outputs = session.session.run(
+            ort::inputs![
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+                "token_type_ids" => token_type_ids_tensor,
+            ]
+        ).map_err(|e| format!("ONNX inference failed: {}", e))?;
+
+        // Extract last_hidden_state [1, seq_len, 384]
+        let output = &outputs[0];
+        let (output_shape, output_data) = output.try_extract_tensor::<f32>()
+            .map_err(|e| format!("Failed to extract output tensor: {}", e))?;
+
+        // output_shape should be [1, seq_len, 384]
+        let hidden_dim = *output_shape.last().unwrap_or(&(EMBEDDING_DIM as i64)) as usize;
+
+        // Mean pooling with attention mask
+        let mut embedding = vec![0.0f32; EMBEDDING_DIM];
+        let mut mask_sum = 0.0f32;
+
+        for token_idx in 0..seq_len {
+            let mask_val = attention_mask[token_idx] as f32;
+            mask_sum += mask_val;
+            let offset = token_idx * hidden_dim;
+            for dim in 0..EMBEDDING_DIM.min(hidden_dim) {
+                embedding[dim] += output_data[offset + dim] * mask_val;
+            }
+        }
+
+        if mask_sum > 0.0 {
+            for dim in 0..EMBEDDING_DIM {
+                embedding[dim] /= mask_sum;
+            }
+        }
+
+        normalize_vector(&mut embedding);
+        Ok(embedding)
     }
 
     /// Hash-based embedding (deterministic, fast, but not semantic)

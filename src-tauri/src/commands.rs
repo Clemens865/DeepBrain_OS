@@ -205,13 +205,25 @@ pub fn update_settings(
     settings: AppSettings,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Store Claude API key in Keychain if present
+    if let Some(ref key) = settings.claude_api_key {
+        if !key.is_empty() {
+            crate::keychain::store_secret("claude_api_key", key)?;
+        }
+    } else {
+        let _ = crate::keychain::delete_secret("claude_api_key");
+    }
+
     *state.settings.write() = settings.clone();
 
     // Refresh AI provider with new settings
     state.refresh_ai_provider();
 
-    // Persist
-    let json = serde_json::to_string(&settings).map_err(|e| format!("Serialize error: {}", e))?;
+    // Persist settings to SQLite (strip API key — it's in Keychain)
+    let mut persist_settings = settings;
+    persist_settings.claude_api_key = None;
+    let json = serde_json::to_string(&persist_settings)
+        .map_err(|e| format!("Serialize error: {}", e))?;
     state.persistence.store_config("app_settings", &json)?;
 
     Ok(())
