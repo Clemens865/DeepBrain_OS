@@ -1,5 +1,12 @@
 import { useEffect, useState, useCallback } from "react";
-import { useAppStore } from "../store/appStore";
+import { invoke, isTauri } from "../services/backend";
+import { useAppStore, type LlmStatus } from "../store/appStore";
+
+interface CommonFolder {
+  label: string;
+  path: string;
+  exists: boolean;
+}
 
 interface SettingsProps {
   onBack: () => void;
@@ -8,10 +15,17 @@ interface SettingsProps {
 export default function Settings({ onBack }: SettingsProps) {
   const { settings, loadSettings, updateSettings, status, addIndexedFolder } = useAppStore();
   const [localSettings, setLocalSettings] = useState(settings);
-  const [newFolder, setNewFolder] = useState("");
+  const [commonFolders, setCommonFolders] = useState<CommonFolder[]>([]);
+
+  // Default folders are Documents, Desktop, Downloads (always watched)
+  const defaultLabels = ["Documents", "Desktop", "Downloads"];
+  const defaultFolders = commonFolders
+    .filter((f) => defaultLabels.includes(f.label))
+    .map((f) => f.path);
 
   useEffect(() => {
     loadSettings();
+    invoke<CommonFolder[]>("get_common_folders").then(setCommonFolders).catch(console.error);
   }, [loadSettings]);
 
   useEffect(() => {
@@ -63,10 +77,18 @@ export default function Settings({ onBack }: SettingsProps) {
             onChange={(v) => setLocalSettings({ ...localSettings, ai_provider: v })}
             options={[
               { value: "ollama", label: "Ollama (Local)" },
+              { value: "ruvllm", label: "RuVector LLM (Local)" },
               { value: "claude", label: "Claude (Cloud)" },
               { value: "none", label: "None (Memory Only)" },
             ]}
           />
+
+          {localSettings.ai_provider === "ruvllm" && (
+            <RuvllmSettings
+              ruvllmModel={localSettings.ruvllm_model}
+              onModelChange={(v) => setLocalSettings({ ...localSettings, ruvllm_model: v })}
+            />
+          )}
 
           {localSettings.ai_provider === "ollama" && (
             <div className="mt-3">
@@ -118,66 +140,105 @@ export default function Settings({ onBack }: SettingsProps) {
           />
         </Section>
 
-        {/* Indexed Folders */}
-        <Section title="Indexed Folders">
-          <div className="space-y-2 mb-2">
-            {(localSettings?.indexed_folders ?? []).length === 0 ? (
-              <p className="text-brain-text/40 text-xs">
-                Default: ~/Documents, ~/Desktop, ~/Downloads
-              </p>
-            ) : (
-              (localSettings?.indexed_folders ?? []).map((folder, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <span className="flex-1 text-brain-text text-xs bg-brain-bg px-3 py-1.5 rounded-lg border border-brain-border truncate">
-                    {folder}
-                  </span>
-                  <button
-                    onClick={() => {
-                      const updated = localSettings!.indexed_folders.filter((_, idx) => idx !== i);
+        {/* Data Sources */}
+        <Section title="Data Sources">
+          <p className="text-brain-text/40 text-[11px] mb-3">
+            Choose which folders DeepBrain can read and index.
+          </p>
+
+          {/* Quick-toggle folder buttons */}
+          <div className="space-y-1.5 mb-3">
+            {commonFolders.filter(f => f.exists).map((folder) => {
+              const isActive = (localSettings?.indexed_folders ?? []).includes(folder.path)
+                || defaultFolders.includes(folder.path);
+              const isDefault = defaultFolders.includes(folder.path);
+              return (
+                <button
+                  key={folder.path}
+                  onClick={() => {
+                    if (isDefault) return; // can't toggle defaults
+                    const current = localSettings?.indexed_folders ?? [];
+                    if (isActive) {
+                      const updated = current.filter(f => f !== folder.path);
                       setLocalSettings({ ...localSettings!, indexed_folders: updated });
-                    }}
-                    className="text-brain-text/30 hover:text-brain-error text-xs transition-colors"
-                  >
-                    Remove
-                  </button>
+                    } else {
+                      addIndexedFolder(folder.path);
+                      setLocalSettings({ ...localSettings!, indexed_folders: [...current, folder.path] });
+                    }
+                  }}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg border text-xs transition-colors text-left ${
+                    isActive
+                      ? "bg-brain-accent/10 border-brain-accent/30 text-brain-accent"
+                      : "bg-brain-bg border-brain-border text-brain-text/50 hover:border-brain-text/30"
+                  }`}
+                >
+                  <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
+                    isActive ? "bg-brain-accent border-brain-accent" : "border-brain-text/30"
+                  }`}>
+                    {isActive && (
+                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                      </svg>
+                    )}
+                  </div>
+                  <span className="flex-1 truncate">{folder.label}</span>
+                  {isDefault && <span className="text-[9px] text-brain-text/30">default</span>}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Custom folders */}
+          {(localSettings?.indexed_folders ?? [])
+            .filter(f => !commonFolders.some(cf => cf.path === f))
+            .map((folder, i) => (
+              <div key={`custom-${i}`} className="flex items-center gap-2 mb-1.5">
+                <div className="w-4 h-4 rounded bg-brain-accent border-brain-accent flex items-center justify-center flex-shrink-0">
+                  <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                  </svg>
                 </div>
-              ))
-            )}
-          </div>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={newFolder}
-              onChange={(e) => setNewFolder(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && newFolder.trim()) {
-                  addIndexedFolder(newFolder.trim());
-                  setLocalSettings({
-                    ...localSettings!,
-                    indexed_folders: [...(localSettings?.indexed_folders ?? []), newFolder.trim()],
-                  });
-                  setNewFolder("");
+                <span className="flex-1 text-brain-accent text-xs truncate">{folder.split("/").pop()}</span>
+                <button
+                  onClick={() => {
+                    const updated = (localSettings?.indexed_folders ?? []).filter(f => f !== folder);
+                    setLocalSettings({ ...localSettings!, indexed_folders: updated });
+                  }}
+                  className="text-brain-text/30 hover:text-red-400 text-[10px] transition-colors"
+                >
+                  remove
+                </button>
+              </div>
+            ))}
+
+          {/* Add custom folder */}
+          <button
+            onClick={async () => {
+              try {
+                let picked: string | null = null;
+                if (isTauri()) {
+                  picked = await invoke<string | null>("pick_folder");
+                } else {
+                  picked = prompt("Enter folder path to index:");
                 }
-              }}
-              placeholder="Paste folder path..."
-              className="flex-1 bg-brain-bg text-white text-xs px-3 py-1.5 rounded-lg border border-brain-border outline-none focus:border-brain-accent/50"
-            />
-            <button
-              onClick={() => {
-                if (newFolder.trim()) {
-                  addIndexedFolder(newFolder.trim());
-                  setLocalSettings({
-                    ...localSettings!,
-                    indexed_folders: [...(localSettings?.indexed_folders ?? []), newFolder.trim()],
-                  });
-                  setNewFolder("");
+                if (picked) {
+                  const current = localSettings?.indexed_folders ?? [];
+                  if (!current.includes(picked)) {
+                    addIndexedFolder(picked);
+                    setLocalSettings({ ...localSettings!, indexed_folders: [...current, picked] });
+                  }
                 }
-              }}
-              className="px-3 py-1.5 bg-brain-surface text-brain-text text-xs rounded-lg border border-brain-border hover:border-brain-accent/30 transition-colors"
-            >
-              Add
-            </button>
-          </div>
+              } catch (e) {
+                console.error("Folder picker failed:", e);
+              }
+            }}
+            className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-dashed border-brain-text/20 text-brain-text/40 text-xs hover:border-brain-accent/30 hover:text-brain-accent transition-colors mt-2"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+            Choose folder...
+          </button>
         </Section>
 
         {/* Auto-Start */}
@@ -273,5 +334,85 @@ function Toggle({
         />
       </div>
     </label>
+  );
+}
+
+function RuvllmSettings({
+  ruvllmModel,
+  onModelChange,
+}: {
+  ruvllmModel: string | null;
+  onModelChange: (v: string | null) => void;
+}) {
+  const { loadModel, unloadModel } = useAppStore();
+  const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    invoke<LlmStatus>("local_model_status").then(setLlmStatus).catch(console.error);
+  }, []);
+
+  const handleLoad = async () => {
+    if (!ruvllmModel?.trim()) return;
+    setLoading(true);
+    await loadModel(ruvllmModel.trim());
+    const status = await invoke<LlmStatus>("local_model_status").catch(() => null);
+    setLlmStatus(status);
+    setLoading(false);
+  };
+
+  const handleUnload = async () => {
+    setLoading(true);
+    await unloadModel();
+    const status = await invoke<LlmStatus>("local_model_status").catch(() => null);
+    setLlmStatus(status);
+    setLoading(false);
+  };
+
+  return (
+    <div className="mt-3 space-y-2">
+      <label className="block text-brain-text/50 text-xs mb-1">Model ID or GGUF Path</label>
+      <input
+        type="text"
+        value={ruvllmModel || ""}
+        onChange={(e) => onModelChange(e.target.value || null)}
+        placeholder="Qwen/Qwen2.5-1.5B-Instruct"
+        className="w-full bg-brain-bg text-white text-sm px-3 py-2 rounded-lg border border-brain-border outline-none focus:border-brain-accent/50"
+      />
+
+      {/* Status indicator */}
+      <div className="flex items-center gap-2 text-xs">
+        <div className={`w-2 h-2 rounded-full ${llmStatus?.model_loaded ? "bg-brain-success" : "bg-brain-text/20"}`} />
+        <span className="text-brain-text/50">
+          {llmStatus?.model_loaded
+            ? `Loaded: ${llmStatus.model_id ?? "unknown"}`
+            : "No model loaded"}
+        </span>
+      </div>
+      {llmStatus?.model_info && (
+        <div className="text-brain-text/30 text-[10px]">{llmStatus.model_info}</div>
+      )}
+
+      {/* Load / Unload buttons */}
+      <div className="flex gap-2">
+        {llmStatus?.model_loaded ? (
+          <button
+            onClick={handleUnload}
+            disabled={loading}
+            className="px-3 py-1.5 bg-brain-error/20 text-brain-error text-xs rounded-lg hover:bg-brain-error/30 transition-colors disabled:opacity-50"
+          >
+            {loading ? "Unloading..." : "Unload Model"}
+          </button>
+        ) : (
+          <button
+            onClick={handleLoad}
+            disabled={loading || !ruvllmModel?.trim()}
+            className="px-3 py-1.5 bg-brain-accent/20 text-brain-accent text-xs rounded-lg hover:bg-brain-accent/30 transition-colors disabled:opacity-30"
+          >
+            {loading ? "Loading..." : "Load Model"}
+          </button>
+        )}
+      </div>
+    </div>
   );
 }

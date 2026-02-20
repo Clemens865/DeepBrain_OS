@@ -1,4 +1,4 @@
-//! AI Provider layer for SuperBrain
+//! AI Provider layer for DeepBrain
 //!
 //! Supports local (Ollama) and cloud (Claude) LLM providers.
 
@@ -24,6 +24,7 @@ pub trait AiProvider: Send + Sync {
         &self,
         prompt: &str,
         context_memories: &[RecallResult],
+        extra_context: &str,
     ) -> Result<AiResponse, String>;
 
     async fn is_available(&self) -> bool;

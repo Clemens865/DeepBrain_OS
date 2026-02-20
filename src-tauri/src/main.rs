@@ -3,10 +3,12 @@
 #![allow(dead_code)]
 
 mod ai;
+mod api;
 mod autostart;
 mod brain;
 mod commands;
 mod context;
+mod deepbrain;
 mod indexer;
 mod keychain;
 mod overlay;
@@ -14,6 +16,7 @@ mod state;
 mod tray;
 mod workflows;
 
+use std::sync::Arc;
 use state::AppState;
 use tauri::Manager;
 
@@ -22,11 +25,11 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "superbrain_app=info".into()),
+                .unwrap_or_else(|_| "deepbrain_app=info".into()),
         )
         .init();
 
-    tracing::info!("SuperBrain starting...");
+    tracing::info!("DeepBrain starting...");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -40,13 +43,20 @@ pub fn run() {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
 
-            // Initialize application state
-            let app_state = AppState::new().expect("Failed to initialize SuperBrain");
+            // Initialize application state (Arc-wrapped for sharing with HTTP API)
+            let app_state = Arc::new(AppState::new().expect("Failed to initialize DeepBrain"));
 
             // Try to initialize Ollama embeddings in background
             let embeddings = app_state.embeddings.clone();
             tauri::async_runtime::spawn(async move {
                 embeddings.try_init_ollama().await;
+            });
+
+            // Spawn HTTP API server (shares the same AppState)
+            let api_state = Arc::clone(&app_state);
+            let api_port = app_state.settings.read().api_port.unwrap_or(19519);
+            tauri::async_runtime::spawn(async move {
+                crate::api::start_api_server(api_state, api_port).await;
             });
 
             app.manage(app_state);
@@ -66,9 +76,9 @@ pub fn run() {
             })?;
 
             // Start file watcher for indexed directories
-            let indexer_ref = app.state::<AppState>().indexer.clone();
+            let indexer_ref = app.state::<Arc<AppState>>().indexer.clone();
             let custom_dirs: Vec<std::path::PathBuf> = app
-                .state::<AppState>()
+                .state::<Arc<AppState>>()
                 .settings
                 .read()
                 .indexed_folders
@@ -116,11 +126,11 @@ pub fn run() {
 
             // Start background cognitive cycle task (battery-aware)
             let engine = app
-                .state::<AppState>()
+                .state::<Arc<AppState>>()
                 .engine
                 .clone();
             let persistence = app
-                .state::<AppState>()
+                .state::<Arc<AppState>>()
                 .persistence
                 .clone();
             let cycle_handle = app.handle().clone();
@@ -152,7 +162,7 @@ pub fn run() {
             });
 
             // Start clipboard monitoring (poll every 2s)
-            let context_ref = app.state::<AppState>().context.clone();
+            let context_ref = app.state::<Arc<AppState>>().context.clone();
             tauri::async_runtime::spawn(async move {
                 let mut last_clipboard = String::new();
                 loop {
@@ -168,12 +178,75 @@ pub fn run() {
                 }
             });
 
+            // Start background email indexing (battery-aware)
+            let email_indexer = app
+                .state::<Arc<AppState>>()
+                .email_indexer
+                .clone();
+            let email_handle = app.handle().clone();
+
+            tauri::async_runtime::spawn(async move {
+                // Wait 30s before first pass to let the app fully settle
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                tracing::info!("Email indexing background task started");
+
+                loop {
+                    tray::set_status(&email_handle, tray::TrayStatus::Learning);
+
+                    match email_indexer.index_pass(50).await {
+                        Ok(count) => {
+                            if count > 0 {
+                                tracing::info!("Email indexer: {} new emails indexed", count);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Email indexing error: {}", e);
+                        }
+                    }
+
+                    tray::set_status(&email_handle, tray::TrayStatus::Idle);
+
+                    // On battery: index every 15 min; plugged in: every 5 min
+                    let on_battery = is_on_battery();
+                    let delay = if on_battery {
+                        tokio::time::Duration::from_secs(900)
+                    } else {
+                        tokio::time::Duration::from_secs(300)
+                    };
+                    tokio::time::sleep(delay).await;
+                }
+            });
+
+            // Start background SONA learning tick
+            let sona_ref = app.state::<Arc<AppState>>().sona.clone();
+            let sona_persistence = app.state::<Arc<AppState>>().persistence.clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait 2 minutes before first tick
+                tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+
+                loop {
+                    // Tick every 5 minutes — SONA internally checks its own interval
+                    // (default 1 hour) and only runs pattern extraction when due
+                    tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+
+                    if let Some(msg) = sona_ref.tick() {
+                        tracing::info!("SONA background learning: {}", msg);
+
+                        // Persist updated patterns after a learning cycle
+                        let patterns = sona_ref.export_patterns();
+                        if let Ok(bytes) = serde_json::to_vec(&patterns) {
+                            let _ = sona_persistence.store_blob("sona_patterns", &bytes);
+                        }
+                    }
+                }
+            });
+
             // Start overlay hidden
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();
             }
 
-            tracing::info!("SuperBrain initialized successfully");
+            tracing::info!("DeepBrain initialized successfully");
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -203,9 +276,35 @@ pub fn run() {
             commands::get_clipboard_history,
             commands::add_indexed_folder,
             commands::flush,
+            commands::list_memories,
+            commands::get_memory,
+            commands::delete_memory,
+            commands::list_indexed_files,
+            commands::update_memory,
+            commands::get_file_chunks,
+            commands::spotlight_search,
+            commands::mail_search,
+            commands::get_common_folders,
+            commands::pick_folder,
+            commands::get_recent_emails,
+            commands::search_emails,
+            commands::email_stats,
+            commands::index_emails,
+            commands::set_pinned,
+            commands::get_pinned,
+            commands::get_storage_metrics,
+            commands::verify_storage,
+            commands::migrate_from_v1,
+            commands::load_local_model,
+            commands::unload_local_model,
+            commands::local_model_status,
+            commands::get_sona_stats,
+            commands::get_nervous_stats,
+            commands::verify_all,
+            commands::bootstrap_sona,
         ])
         .run(tauri::generate_context!())
-        .expect("Error while running SuperBrain");
+        .expect("Error while running DeepBrain");
 }
 
 fn main() {

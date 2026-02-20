@@ -1,10 +1,11 @@
 //! Auto-start on login for macOS
 //!
-//! Manages a LaunchAgent plist to start SuperBrain at login.
+//! Manages a LaunchAgent plist to start DeepBrain at login.
 
 use std::path::PathBuf;
 
-const PLIST_LABEL: &str = "com.superbrain.app";
+const PLIST_LABEL: &str = "com.deepbrain.app";
+const LEGACY_PLIST_LABEL: &str = "com.superbrain.app";
 
 /// Get the LaunchAgents directory path
 fn launch_agents_dir() -> Option<PathBuf> {
@@ -16,6 +17,11 @@ fn plist_path() -> Option<PathBuf> {
     launch_agents_dir().map(|d| d.join(format!("{}.plist", PLIST_LABEL)))
 }
 
+/// Get the legacy plist file path
+fn legacy_plist_path() -> Option<PathBuf> {
+    launch_agents_dir().map(|d| d.join(format!("{}.plist", LEGACY_PLIST_LABEL)))
+}
+
 /// Get the path to the current executable
 fn app_executable() -> Option<String> {
     std::env::current_exe()
@@ -23,8 +29,24 @@ fn app_executable() -> Option<String> {
         .and_then(|p| p.to_str().map(|s| s.to_string()))
 }
 
+/// Clean up the old com.superbrain.app plist if it exists
+fn cleanup_legacy_plist() {
+    if let Some(legacy) = legacy_plist_path() {
+        if legacy.exists() {
+            if let Err(e) = std::fs::remove_file(&legacy) {
+                tracing::warn!("Failed to remove legacy plist {}: {}", legacy.display(), e);
+            } else {
+                tracing::info!("Removed legacy autostart plist: {}", legacy.display());
+            }
+        }
+    }
+}
+
 /// Enable or disable auto-start at login
 pub fn set_auto_start(enabled: bool) -> Result<(), String> {
+    // Always clean up old plist
+    cleanup_legacy_plist();
+
     let plist = plist_path().ok_or("Cannot determine LaunchAgents path")?;
 
     if enabled {

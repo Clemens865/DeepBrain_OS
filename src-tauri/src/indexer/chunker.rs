@@ -1,4 +1,4 @@
-//! Text chunker for SuperBrain
+//! Text chunker for DeepBrain
 //!
 //! Splits text into overlapping chunks for embedding.
 

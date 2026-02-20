@@ -1,4 +1,4 @@
-//! File system watcher for SuperBrain
+//! File system watcher for DeepBrain
 //!
 //! Monitors directories for changes and triggers re-indexing.
 

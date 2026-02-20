@@ -1,4 +1,4 @@
-//! System tray management for SuperBrain
+//! System tray management for DeepBrain
 
 use tauri::{
     image::Image,
@@ -17,22 +17,33 @@ pub enum TrayStatus {
 
 /// Set up the system tray icon and menu
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let show = MenuItem::with_id(app, "show", "Show SuperBrain", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "Show DeepBrain", true, None::<&str>)?;
+    let pin_label = if crate::overlay::is_pinned() { "Unpin Window" } else { "Pin Window" };
+    let pin = MenuItem::with_id(app, "pin", pin_label, true, None::<&str>)?;
     let status = MenuItem::with_id(app, "status", "Status: Running", false, None::<&str>)?;
     let separator = MenuItem::with_id(app, "sep1", "---", false, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings...", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit SuperBrain", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit DeepBrain", true, None::<&str>)?;
 
-    let menu = Menu::with_items(app, &[&show, &status, &separator, &settings, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &pin, &status, &separator, &settings, &quit])?;
 
+    let pin_item = pin.clone();
     let _tray = TrayIconBuilder::with_id("main-tray")
         .menu(&menu)
-        .tooltip("SuperBrain - Cognitive Assistant")
+        .tooltip("DeepBrain - Cognitive Assistant")
         .icon(make_status_icon(TrayStatus::Idle))
         .on_menu_event(move |app, event| {
             match event.id.as_ref() {
                 "show" => {
                     toggle_overlay(app);
+                }
+                "pin" => {
+                    let new_state = !crate::overlay::is_pinned();
+                    crate::overlay::set_pinned(new_state);
+                    let label = if new_state { "Unpin Window" } else { "Pin Window" };
+                    let _ = pin_item.set_text(label);
+                    // Notify frontend
+                    let _ = app.emit("pin-changed", new_state);
                 }
                 "settings" => {
                     if let Some(window) = app.get_webview_window("main") {
@@ -44,7 +55,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 "quit" => {
                     // Flush state before quitting
-                    if let Some(state) = app.try_state::<crate::state::AppState>() {
+                    if let Some(state) = app.try_state::<std::sync::Arc<crate::state::AppState>>() {
                         let _ = state.flush();
                     }
                     app.exit(0);
@@ -72,9 +83,9 @@ pub fn set_status(app: &AppHandle, status: TrayStatus) {
     if let Some(tray) = app.tray_by_id("main-tray") {
         let _ = tray.set_icon(Some(make_status_icon(status)));
         let tooltip = match status {
-            TrayStatus::Idle => "SuperBrain - Idle",
-            TrayStatus::Thinking => "SuperBrain - Thinking...",
-            TrayStatus::Learning => "SuperBrain - Learning...",
+            TrayStatus::Idle => "DeepBrain - Idle",
+            TrayStatus::Thinking => "DeepBrain - Thinking...",
+            TrayStatus::Learning => "DeepBrain - Learning...",
         };
         let _ = tray.set_tooltip(Some(tooltip));
     }

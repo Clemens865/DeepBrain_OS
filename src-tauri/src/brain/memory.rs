@@ -1,4 +1,4 @@
-//! High-performance memory system for SuperBrain (Tauri port)
+//! High-performance memory system for DeepBrain (Tauri port)
 //!
 //! Features:
 //! - Lock-free concurrent access via DashMap
@@ -14,10 +14,13 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
+use std::sync::Arc;
+
 use crate::brain::types::{DistanceMetric, MemoryEntry, MemoryType, parse_memory_type};
 use crate::brain::utils::{
     cosine_similarity, dot_product, euclidean_distance, generate_id, normalize_vector, now_millis,
 };
+use crate::deepbrain::vector_store::{DeepBrainVectorStore, VectorFilter, VectorMetadata};
 
 /// Internal memory storage with vector
 #[derive(Debug, Clone)]
@@ -41,6 +44,9 @@ pub struct NativeMemory {
     type_indices: DashMap<String, Vec<String>, ahash::RandomState>,
     /// Vector dimension
     dimensions: usize,
+    /// RVF-backed vector store for crash-safe, indexed search.
+    /// None = brute-force fallback (tests or when store not yet initialized).
+    vector_store: Option<Arc<DeepBrainVectorStore>>,
     /// Configuration
     config: RwLock<MemoryConfig>,
     /// Statistics
@@ -70,12 +76,26 @@ impl Default for MemoryConfig {
 }
 
 impl NativeMemory {
-    /// Create a new native memory system
+    /// Create a new native memory system (brute-force fallback, no RVF store).
     pub fn new(dimensions: u32) -> Self {
         Self {
             memories: DashMap::with_hasher(ahash::RandomState::new()),
             type_indices: DashMap::with_hasher(ahash::RandomState::new()),
             dimensions: dimensions as usize,
+            vector_store: None,
+            config: RwLock::new(MemoryConfig::default()),
+            total_accesses: AtomicU64::new(0),
+            total_stores: AtomicU64::new(0),
+        }
+    }
+
+    /// Create a new native memory system backed by a DeepBrain RVF vector store.
+    pub fn with_vector_store(dimensions: u32, store: Arc<DeepBrainVectorStore>) -> Self {
+        Self {
+            memories: DashMap::with_hasher(ahash::RandomState::new()),
+            type_indices: DashMap::with_hasher(ahash::RandomState::new()),
+            dimensions: dimensions as usize,
+            vector_store: Some(store),
             config: RwLock::new(MemoryConfig::default()),
             total_accesses: AtomicU64::new(0),
             total_stores: AtomicU64::new(0),
@@ -150,6 +170,20 @@ impl NativeMemory {
 
         let id = generate_id();
         let mem_type = parse_memory_type(&memory_type);
+
+        // Insert into RVF vector store if available.
+        if let Some(ref store) = self.vector_store {
+            let meta = VectorMetadata {
+                source: "memory".to_string(),
+                memory_type: memory_type.clone(),
+                importance,
+                timestamp: now_millis(),
+                ..Default::default()
+            };
+            if let Err(e) = store.store_vector(&id, &vector, meta) {
+                tracing::warn!("Failed to store vector in RVF: {}", e);
+            }
+        }
 
         let node = MemoryNode {
             id: id.clone(),
@@ -294,7 +328,8 @@ impl NativeMemory {
         Ok(top_k)
     }
 
-    /// Search with f32 query (no conversion needed)
+    /// Search with f32 query (no conversion needed).
+    /// Uses HNSW index for O(log n) search when available, falls back to brute force.
     pub fn search_f32(
         &self,
         query: &[f32],
@@ -310,6 +345,14 @@ impl NativeMemory {
         let type_filter: Option<Vec<MemoryType>> = memory_types
             .map(|types| types.iter().map(|t| parse_memory_type(t)).collect());
 
+        // Try RVF vector store first (fast O(log n) HNSW)
+        if let Some(ref store) = self.vector_store {
+            if self.memories.len() > 10 {
+                return self.search_f32_rvf(store, query, k, type_filter.as_ref(), min_sim);
+            }
+        }
+
+        // Fallback: brute-force scan (used for small memory counts or before HNSW is built)
         let config = self.config.read();
 
         let mut results: Vec<(String, f32, MemoryNode)> = self
@@ -374,6 +417,78 @@ impl NativeMemory {
         Ok(top_k)
     }
 
+    /// RVF vector store accelerated search with post-filtering for decay/type.
+    fn search_f32_rvf(
+        &self,
+        store: &DeepBrainVectorStore,
+        query: &[f32],
+        k: u32,
+        type_filter: Option<&Vec<MemoryType>>,
+        min_sim: f32,
+    ) -> Result<Vec<SearchResult>, String> {
+        // Build filter for source=memory. Type filtering is done post-search
+        // against the DashMap since RVF metadata filtering is coarser.
+        let filter = Some(VectorFilter::Source("memory".to_string()));
+
+        // Over-fetch to account for type filtering and decay adjustments.
+        let fetch_k = if type_filter.is_some() {
+            (k as usize) * 4
+        } else {
+            (k as usize) * 2
+        };
+
+        let rvf_results = store
+            .search(query, fetch_k, filter)
+            .map_err(|e| format!("RVF search failed: {}", e))?;
+
+        let mut results: Vec<SearchResult> = rvf_results
+            .into_iter()
+            .filter_map(|vr| {
+                let node = self.memories.get(&vr.id)?;
+                let node = node.value();
+
+                // Type filter
+                if let Some(types) = type_filter {
+                    if !types.contains(&node.memory_type) {
+                        return None;
+                    }
+                }
+
+                // Apply decay adjustment to RVF similarity score.
+                let adjusted_sim = vr.similarity as f32 * (1.0 - node.decay as f32);
+
+                if adjusted_sim < min_sim {
+                    return None;
+                }
+
+                Some(SearchResult {
+                    id: vr.id,
+                    content: node.content.clone(),
+                    similarity: adjusted_sim as f64,
+                    memory_type: format!("{:?}", node.memory_type),
+                    importance: node.importance,
+                })
+            })
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(k as usize);
+
+        // Update access counts.
+        for r in &results {
+            if let Some(mut entry) = self.memories.get_mut(&r.id) {
+                entry.access_count += 1;
+            }
+            self.total_accesses.fetch_add(1, Ordering::Relaxed);
+        }
+
+        Ok(results)
+    }
+
     /// Connect two memories
     pub fn connect(&self, id1: &str, id2: &str) -> bool {
         if let Some(mut node1) = self.memories.get_mut(id1) {
@@ -413,6 +528,12 @@ impl NativeMemory {
             .collect();
 
         for id in to_prune {
+            // Delete from RVF vector store.
+            if let Some(ref store) = self.vector_store {
+                if let Err(e) = store.delete(&id) {
+                    tracing::warn!("Failed to delete vector from RVF during consolidation: {}", e);
+                }
+            }
             self.memories.remove(&id);
             pruned += 1;
         }
@@ -428,8 +549,31 @@ impl NativeMemory {
         }
     }
 
+    /// Update a memory's content, type, and/or importance
+    pub fn update(&self, id: &str, content: Option<String>, memory_type: Option<String>, importance: Option<f64>) -> bool {
+        if let Some(mut entry) = self.memories.get_mut(id) {
+            if let Some(c) = content {
+                entry.content = c;
+            }
+            if let Some(mt) = memory_type {
+                entry.memory_type = parse_memory_type(&mt);
+            }
+            if let Some(imp) = importance {
+                entry.importance = imp;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Delete a memory
     pub fn delete(&self, id: &str) -> bool {
+        if let Some(ref store) = self.vector_store {
+            if let Err(e) = store.delete(id) {
+                tracing::warn!("Failed to delete vector from RVF: {}", e);
+            }
+        }
         self.memories.remove(id).is_some()
     }
 
@@ -462,10 +606,28 @@ impl NativeMemory {
         self.memories.iter().map(|e| e.value().clone()).collect()
     }
 
-    /// Restore a memory node (for persistence loading)
+    /// Restore a memory node (for persistence loading).
+    ///
+    /// When a vector_store is present, this inserts the vector into RVF.
+    /// The DashMap is always populated for fast metadata lookups.
     pub fn restore_node(&self, node: MemoryNode) {
         let type_str = format!("{:?}", node.memory_type);
         let id = node.id.clone();
+
+        // Insert into RVF vector store if available.
+        if let Some(ref store) = self.vector_store {
+            let meta = VectorMetadata {
+                source: "memory".to_string(),
+                memory_type: type_str.clone(),
+                importance: node.importance,
+                timestamp: node.timestamp,
+                ..Default::default()
+            };
+            if let Err(e) = store.store_vector(&id, &node.vector, meta) {
+                tracing::warn!("Failed to restore vector into RVF: {}", e);
+            }
+        }
+
         self.memories.insert(id.clone(), node);
         self.type_indices
             .entry(type_str)

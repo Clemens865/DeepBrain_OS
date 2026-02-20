@@ -1,7 +1,7 @@
 {
-  "productName": "SuperBrain",
-  "identifier": "com.superbrain.app",
-  "version": "0.1.0",
+  "productName": "DeepBrain",
+  "identifier": "com.deepbrain.app",
+  "version": "0.2.0",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -14,10 +14,10 @@
     "windows": [
       {
         "label": "main",
-        "title": "SuperBrain",
+        "title": "DeepBrain",
         "width": 680,
         "height": 480,
-        "minWidth": 500,
+        "minWidth": 680,
         "minHeight": 64,
         "decorations": false,
         "transparent": true,

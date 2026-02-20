@@ -1,10 +1,13 @@
-//! Overlay window management for SuperBrain
+//! Overlay window management for DeepBrain
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// Timestamp (ms) of the last show() call — used to debounce blur events
 static LAST_SHOW_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Whether the window is pinned (should not auto-hide on blur)
+static PINNED: AtomicBool = AtomicBool::new(false);
 
 /// Minimum time (ms) the window must be visible before blur can hide it.
 /// This prevents the global-shortcut key-release from immediately dismissing
@@ -41,9 +44,23 @@ pub fn hide(app: &AppHandle) {
     }
 }
 
+/// Returns true if the window is pinned (should not auto-hide on blur).
+pub fn is_pinned() -> bool {
+    PINNED.load(Ordering::Relaxed)
+}
+
+/// Set the pinned state.
+pub fn set_pinned(pinned: bool) {
+    PINNED.store(pinned, Ordering::Relaxed);
+}
+
 /// Returns true if enough time has passed since the last show() that a blur
-/// event should be honoured.  Called from the `on_window_event` handler.
+/// event should be honoured, and the window is not pinned.
+/// Called from the `on_window_event` handler.
 pub fn should_hide_on_blur() -> bool {
+    if is_pinned() {
+        return false;
+    }
     let shown_at = LAST_SHOW_MS.load(Ordering::Relaxed);
     now_ms() - shown_at > BLUR_DEBOUNCE_MS
 }

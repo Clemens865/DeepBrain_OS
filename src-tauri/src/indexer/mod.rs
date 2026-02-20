@@ -1,9 +1,10 @@
-//! File indexer for SuperBrain
+//! File indexer for DeepBrain
 //!
 //! Watches filesystem, chunks files, and indexes them with vector embeddings
 //! for semantic file search.
 
 pub mod chunker;
+pub mod email;
 pub mod parser;
 pub mod watcher;
 
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::brain::embeddings::EmbeddingModel;
 use crate::brain::utils::cosine_similarity;
+use crate::deepbrain::vector_store::{DeepBrainVectorStore, VectorFilter, VectorMetadata};
 
 /// File search result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,19 +54,54 @@ pub struct FileIndexer {
     watched_dirs: RwLock<Vec<PathBuf>>,
     embeddings: Arc<EmbeddingModel>,
     is_indexing: RwLock<bool>,
+    /// RVF-backed vector store (None = brute-force fallback).
+    vector_store: Option<Arc<DeepBrainVectorStore>>,
 }
 
 impl FileIndexer {
-    /// Create a new file indexer
+    /// Create a new file indexer (brute-force fallback, no RVF store).
     pub fn new(db_path: PathBuf, embeddings: Arc<EmbeddingModel>) -> Result<Self, String> {
         let indexer = Self {
             db_path,
             watched_dirs: RwLock::new(Vec::new()),
             embeddings,
             is_indexing: RwLock::new(false),
+            vector_store: None,
         };
         indexer.initialize_db()?;
         Ok(indexer)
+    }
+
+    /// Create a new file indexer backed by a DeepBrain RVF vector store.
+    pub fn with_vector_store(
+        db_path: PathBuf,
+        embeddings: Arc<EmbeddingModel>,
+        store: Arc<DeepBrainVectorStore>,
+    ) -> Result<Self, String> {
+        let indexer = Self {
+            db_path,
+            watched_dirs: RwLock::new(Vec::new()),
+            embeddings,
+            is_indexing: RwLock::new(false),
+            vector_store: Some(store),
+        };
+        indexer.initialize_db()?;
+        Ok(indexer)
+    }
+
+    /// Build vector index from existing file_chunks in SQLite.
+    ///
+    /// When an RVF vector store is configured, this is a no-op because
+    /// RVF boots automatically from its manifest. When no store is configured,
+    /// this is also a no-op (brute-force scan doesn't need pre-building).
+    pub fn build_hnsw_index(&self) -> Result<usize, String> {
+        if self.vector_store.is_some() {
+            // RVF store boots from manifest — no need to rebuild.
+            tracing::info!("RVF vector store active — skipping HNSW rebuild");
+            return Ok(0);
+        }
+        // No index to build in brute-force mode.
+        Ok(0)
     }
 
     fn open_connection(&self) -> Result<Connection, String> {
@@ -181,7 +218,7 @@ impl FileIndexer {
         )
         .map_err(|e| format!("Delete chunks failed: {}", e))?;
 
-        // Insert new chunks
+        // Insert new chunks (SQLite + RVF vector store)
         for chunk in &file_chunks {
             let vector_bytes = vector_to_bytes(&chunk.vector);
             conn.execute(
@@ -189,6 +226,20 @@ impl FileIndexer {
                 params![chunk.file_path, chunk.chunk_index, chunk.content, vector_bytes],
             )
             .map_err(|e| format!("Store chunk failed: {}", e))?;
+
+            // Also insert into RVF vector store for indexed search.
+            if let Some(ref store) = self.vector_store {
+                let chunk_id = format!("file::{}::{}", chunk.file_path, chunk.chunk_index);
+                let meta = VectorMetadata {
+                    source: "file".to_string(),
+                    path: chunk.file_path.clone(),
+                    timestamp: modified,
+                    ..Default::default()
+                };
+                if let Err(e) = store.store_vector(&chunk_id, &chunk.vector, meta) {
+                    tracing::warn!("Failed to store file chunk in RVF: {}", e);
+                }
+            }
         }
 
         Ok(file_chunks.len() as u32)
@@ -227,10 +278,113 @@ impl FileIndexer {
         Ok(total)
     }
 
-    /// Search indexed files by semantic similarity
+    /// Search indexed files by semantic similarity.
+    /// Uses RVF vector store for O(log n) search when available, falls back to brute-force.
     pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<FileResult>, String> {
         let query_vector = self.embeddings.embed(query).await?;
 
+        // Try RVF vector store first (fast O(log n))
+        if let Some(ref store) = self.vector_store {
+            return self.search_rvf(store, &query_vector, limit);
+        }
+
+        // Fallback: brute-force scan of all chunks
+        self.search_brute_force(&query_vector, limit)
+    }
+
+    /// RVF-accelerated file search.
+    fn search_rvf(
+        &self,
+        store: &DeepBrainVectorStore,
+        query_vector: &[f32],
+        limit: u32,
+    ) -> Result<Vec<FileResult>, String> {
+        // Over-fetch to allow for type boosting to reorder results.
+        let fetch_k = (limit as usize) * 3;
+        let filter = Some(VectorFilter::Source("file".to_string()));
+
+        let rvf_results = store
+            .search(query_vector, fetch_k, filter)
+            .map_err(|e| format!("RVF search failed: {}", e))?;
+
+        let conn = self.open_connection()?;
+
+        let mut results: Vec<FileResult> = Vec::with_capacity(rvf_results.len());
+        for vr in &rvf_results {
+            if vr.similarity < 0.25 {
+                continue;
+            }
+
+            // Parse the RVF ID: "file::{file_path}::{chunk_index}"
+            let id_str = &vr.id;
+            let stripped = id_str.strip_prefix("file::").unwrap_or(id_str);
+            let parts: Vec<&str> = stripped.rsplitn(2, "::").collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let file_path = parts[1];
+            let chunk_index: u32 = match parts[0].parse() {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            // Look up content and metadata from SQLite.
+            let row_result = conn.query_row(
+                "SELECT fc.content, fi.name, fi.ext
+                 FROM file_chunks fc
+                 JOIN file_index fi ON fc.file_path = fi.path
+                 WHERE fc.file_path = ?1 AND fc.chunk_index = ?2",
+                params![file_path, chunk_index],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            );
+
+            if let Ok((content, name, ext)) = row_result {
+                results.push(FileResult {
+                    path: file_path.to_string(),
+                    name,
+                    chunk: content,
+                    similarity: vr.similarity,
+                    file_type: ext,
+                });
+            }
+        }
+
+        // Apply file-type boost.
+        for result in &mut results {
+            match result.file_type.as_str() {
+                "md" | "txt" | "pdf" | "rtf" | "docx" | "doc" => {
+                    result.similarity *= 1.15;
+                }
+                "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "cpp"
+                | "h" | "swift" => {
+                    result.similarity *= 0.95;
+                }
+                _ => {}
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit as usize);
+
+        Ok(results)
+    }
+
+    /// Brute-force file search (fallback when HNSW not built)
+    fn search_brute_force(
+        &self,
+        query_vector: &[f32],
+        limit: u32,
+    ) -> Result<Vec<FileResult>, String> {
         let conn = self.open_connection()?;
         let mut stmt = conn
             .prepare(
@@ -249,7 +403,7 @@ impl FileIndexer {
                 let ext: String = row.get(4)?;
 
                 let vector = bytes_to_vector(&vector_bytes);
-                let similarity = cosine_similarity(&query_vector, &vector) as f64;
+                let similarity = cosine_similarity(query_vector, &vector) as f64;
 
                 Ok(FileResult {
                     path: file_path,
@@ -261,13 +415,116 @@ impl FileIndexer {
             })
             .map_err(|e| format!("Search failed: {}", e))?
             .filter_map(|r| r.ok())
-            .filter(|r| r.similarity > 0.1)
+            .filter(|r| r.similarity > 0.25)
             .collect();
 
-        results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+        // Boost documentation files by 15%, slight penalty for code files
+        for result in &mut results {
+            match result.file_type.as_str() {
+                "md" | "txt" | "pdf" | "rtf" | "docx" | "doc" => {
+                    result.similarity *= 1.15;
+                }
+                "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "cpp"
+                | "h" | "swift" => {
+                    result.similarity *= 0.95;
+                }
+                _ => {}
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit as usize);
 
         Ok(results)
+    }
+
+    /// List indexed files for browsing
+    pub fn list_files(&self, folder: Option<&str>, limit: u32, offset: u32) -> Result<Vec<FileListItem>, String> {
+        let conn = self.open_connection()?;
+
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(folder) = folder {
+            let pattern = format!("{}%", folder);
+            (
+                "SELECT path, name, ext, modified, chunk_count FROM file_index WHERE path LIKE ?1 ORDER BY modified DESC LIMIT ?2 OFFSET ?3".to_string(),
+                vec![Box::new(pattern) as Box<dyn rusqlite::types::ToSql>, Box::new(limit), Box::new(offset)],
+            )
+        } else {
+            (
+                "SELECT path, name, ext, modified, chunk_count FROM file_index ORDER BY modified DESC LIMIT ?1 OFFSET ?2".to_string(),
+                vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>, Box::new(offset)],
+            )
+        };
+
+        let mut stmt = conn.prepare(&sql).map_err(|e| format!("Query failed: {}", e))?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let items = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(FileListItem {
+                    path: row.get(0)?,
+                    name: row.get(1)?,
+                    ext: row.get(2)?,
+                    modified: row.get(3)?,
+                    chunk_count: row.get(4)?,
+                })
+            })
+            .map_err(|e| format!("List files failed: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(items)
+    }
+
+    /// Get chunks for a specific file (for preview)
+    pub fn get_file_chunks(&self, file_path: &str, limit: u32) -> Result<Vec<FileChunkItem>, String> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn
+            .prepare("SELECT chunk_index, content FROM file_chunks WHERE file_path = ?1 ORDER BY chunk_index ASC LIMIT ?2")
+            .map_err(|e| format!("Query failed: {}", e))?;
+
+        let items = stmt
+            .query_map(params![file_path, limit], |row| {
+                Ok(FileChunkItem {
+                    chunk_index: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(|e| format!("Get chunks failed: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(items)
+    }
+
+    /// Sample random vectors from the file index for SONA bootstrapping.
+    /// Returns (embedding, modified_timestamp) pairs.
+    pub fn sample_vectors(&self, count: u32) -> Result<Vec<(Vec<f32>, i64)>, String> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT fc.vector, fi.modified
+                 FROM file_chunks fc
+                 JOIN file_index fi ON fc.file_path = fi.path
+                 ORDER BY RANDOM()
+                 LIMIT ?1",
+            )
+            .map_err(|e| format!("sample_vectors query failed: {}", e))?;
+
+        let rows = stmt
+            .query_map(params![count], |row| {
+                let vector_bytes: Vec<u8> = row.get(0)?;
+                let modified: i64 = row.get(1)?;
+                Ok((bytes_to_vector(&vector_bytes), modified))
+            })
+            .map_err(|e| format!("sample_vectors failed: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
     }
 
     /// Get index statistics
@@ -291,6 +548,23 @@ impl FileIndexer {
             is_indexing,
         })
     }
+}
+
+/// File list item for browsing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileListItem {
+    pub path: String,
+    pub name: String,
+    pub ext: String,
+    pub modified: i64,
+    pub chunk_count: u32,
+}
+
+/// File chunk content for preview
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChunkItem {
+    pub chunk_index: u32,
+    pub content: String,
 }
 
 /// Index statistics
@@ -331,7 +605,6 @@ const SKIP_DIRS: &[&str] = &[
     "build",
     "dist",
     ".Trash",
-    "Library",
 ];
 
 /// Recursively collect files, skipping hidden/undesirable directories

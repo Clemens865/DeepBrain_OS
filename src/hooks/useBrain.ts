@@ -1,6 +1,5 @@
 import { useEffect, useCallback } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "../services/backend";
 
 /** Hook for brain event listeners */
 export function useBrainEvents(callbacks?: {
@@ -9,25 +8,32 @@ export function useBrainEvents(callbacks?: {
   onCycleCompleted?: () => void;
 }) {
   useEffect(() => {
+    // Event listeners only work in Tauri mode (IPC events)
+    if (!isTauri()) return;
+
     const unlisteners: (() => void)[] = [];
 
-    if (callbacks?.onMemoryStored) {
-      listen<string>("memory_stored", (event) => {
-        callbacks.onMemoryStored?.(event.payload);
-      }).then((fn) => unlisteners.push(fn));
-    }
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
 
-    if (callbacks?.onThoughtGenerated) {
-      listen("thought_generated", (event) => {
-        callbacks.onThoughtGenerated?.(event.payload);
-      }).then((fn) => unlisteners.push(fn));
-    }
+      if (callbacks?.onMemoryStored) {
+        listen<string>("memory_stored", (event) => {
+          callbacks.onMemoryStored?.(event.payload);
+        }).then((fn) => unlisteners.push(fn));
+      }
 
-    if (callbacks?.onCycleCompleted) {
-      listen("cycle_completed", () => {
-        callbacks.onCycleCompleted?.();
-      }).then((fn) => unlisteners.push(fn));
-    }
+      if (callbacks?.onThoughtGenerated) {
+        listen("thought_generated", (event) => {
+          callbacks.onThoughtGenerated?.(event.payload);
+        }).then((fn) => unlisteners.push(fn));
+      }
+
+      if (callbacks?.onCycleCompleted) {
+        listen("cycle_completed", () => {
+          callbacks.onCycleCompleted?.();
+        }).then((fn) => unlisteners.push(fn));
+      }
+    })();
 
     return () => {
       unlisteners.forEach((fn) => fn());

@@ -15,7 +15,7 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new(model: &str) -> Self {
         Self {
-            base_url: "http://localhost:11434".to_string(),
+            base_url: "http://127.0.0.1:11434".to_string(),
             model: model.to_string(),
             client: reqwest::Client::new(),
         }
@@ -35,6 +35,12 @@ struct GenerateRequest {
     model: String,
     prompt: String,
     stream: bool,
+    options: GenerateOptions,
+}
+
+#[derive(Serialize)]
+struct GenerateOptions {
+    num_ctx: u32,
 }
 
 #[derive(Deserialize)]
@@ -58,13 +64,16 @@ impl super::AiProvider for OllamaProvider {
         &self,
         prompt: &str,
         context_memories: &[RecallResult],
+        extra_context: &str,
     ) -> Result<AiResponse, String> {
         let memory_context = format_memory_context(context_memories);
 
         let full_prompt = format!(
-            "You are SuperBrain, an intelligent cognitive assistant. \
-             Use the following memory context to inform your response.\n\
+            "You are DeepBrain, an intelligent cognitive assistant running on macOS. \
+             You have access to the user's memories, indexed files, and system search results. \
+             Use ALL of the following context to provide an informed, helpful response.\n\
              {memory_context}\
+             {extra_context}\
              User: {prompt}\n\
              Assistant:"
         );
@@ -78,8 +87,9 @@ impl super::AiProvider for OllamaProvider {
                 model: self.model.clone(),
                 prompt: full_prompt,
                 stream: false,
+                options: GenerateOptions { num_ctx: 8192 },
             })
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .map_err(|e| format!("Ollama request failed: {}", e))?;

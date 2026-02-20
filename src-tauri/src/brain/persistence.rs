@@ -1,7 +1,7 @@
-//! SQLite persistence layer for SuperBrain
+//! SQLite persistence layer for DeepBrain
 //!
 //! Persists memories, Q-table, experiences, goals, and configuration
-//! to ~/Library/Application Support/SuperBrain/brain.db
+//! to ~/Library/Application Support/DeepBrain/brain.db
 
 use std::path::PathBuf;
 
@@ -21,7 +21,7 @@ impl BrainPersistence {
     pub fn new() -> Result<Self, String> {
         let data_dir = dirs::data_dir()
             .ok_or("Could not find Application Support directory")?
-            .join("SuperBrain");
+            .join("DeepBrain");
 
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data directory: {}", e))?;
@@ -106,6 +106,22 @@ impl BrainPersistence {
             CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
             CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
             CREATE INDEX IF NOT EXISTS idx_memories_timestamp ON memories(timestamp);
+
+            CREATE TABLE IF NOT EXISTS query_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_hash INTEGER NOT NULL,
+                result_ids TEXT NOT NULL,
+                selected_id TEXT,
+                source TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_query_log_ts ON query_log(timestamp);
+
+            CREATE TABLE IF NOT EXISTS blob_store (
+                key TEXT PRIMARY KEY,
+                data BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| format!("Failed to create tables: {}", e))?;
@@ -323,6 +339,121 @@ impl BrainPersistence {
     /// Get database path
     pub fn db_path(&self) -> &PathBuf {
         &self.db_path
+    }
+
+    // ---- Query Log ----
+
+    /// Log a search query and its results for GNN training
+    pub fn log_query(
+        &self,
+        query_hash: i64,
+        result_ids: &[String],
+        selected_id: Option<&str>,
+        source: &str,
+    ) -> Result<(), String> {
+        let conn = self.open_connection()?;
+        let ids_json =
+            serde_json::to_string(result_ids).unwrap_or_else(|_| "[]".to_string());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        conn.execute(
+            "INSERT INTO query_log (query_hash, result_ids, selected_id, source, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![query_hash, ids_json, selected_id, source, now],
+        )
+        .map_err(|e| format!("Failed to log query: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Load recent query log entries for training
+    pub fn load_recent_query_logs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::brain::gnn::QueryLogEntry>, String> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT query_hash, result_ids, selected_id, source, timestamp
+                 FROM query_log ORDER BY timestamp DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let entries = stmt
+            .query_map(params![limit as u32], |row| {
+                let query_hash: i64 = row.get(0)?;
+                let result_ids_json: String = row.get(1)?;
+                let selected_id: Option<String> = row.get(2)?;
+                let source: String = row.get(3)?;
+                let timestamp: i64 = row.get(4)?;
+
+                let result_ids: Vec<String> =
+                    serde_json::from_str(&result_ids_json).unwrap_or_default();
+
+                Ok(crate::brain::gnn::QueryLogEntry {
+                    query_hash,
+                    result_ids,
+                    selected_id,
+                    source,
+                    timestamp,
+                })
+            })
+            .map_err(|e| format!("Failed to query logs: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(entries)
+    }
+
+    /// Get the count of query log entries since a given timestamp
+    pub fn query_log_count_since(&self, since_ms: i64) -> Result<u32, String> {
+        let conn = self.open_connection()?;
+        let count: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM query_log WHERE timestamp > ?1",
+                params![since_ms],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to count query logs: {}", e))?;
+        Ok(count)
+    }
+
+    // ---- Blob Store (for HNSW index and GNN weights) ----
+
+    /// Store a binary blob
+    pub fn store_blob(&self, key: &str, data: &[u8]) -> Result<(), String> {
+        let conn = self.open_connection()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO blob_store (key, data, updated_at) VALUES (?1, ?2, ?3)",
+            params![key, data, now],
+        )
+        .map_err(|e| format!("Failed to store blob: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Load a binary blob
+    pub fn load_blob(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        let conn = self.open_connection()?;
+        let result = conn.query_row(
+            "SELECT data FROM blob_store WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to load blob: {}", e)),
+        }
     }
 }
 

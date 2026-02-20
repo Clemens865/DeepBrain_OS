@@ -1,4 +1,4 @@
-//! Context awareness for SuperBrain
+//! Context awareness for DeepBrain
 //!
 //! Monitors clipboard and provides contextual boosts for search.
 

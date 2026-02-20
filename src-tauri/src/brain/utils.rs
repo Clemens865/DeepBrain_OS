@@ -1,4 +1,4 @@
-//! Utility functions for SuperBrain
+//! Utility functions for DeepBrain
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

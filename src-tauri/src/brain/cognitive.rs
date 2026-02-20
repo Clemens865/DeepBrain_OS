@@ -1,4 +1,4 @@
-//! Cognitive processing engine for SuperBrain (Tauri port)
+//! Cognitive processing engine for DeepBrain (Tauri port)
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -6,10 +6,11 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::brain::learning::NativeLearner;
 use crate::brain::memory::NativeMemory;
 use crate::brain::types::{CognitiveConfig, CognitiveStats, Thought, ThoughtType};
 use crate::brain::utils::{generate_id, now_millis};
+use crate::deepbrain::nervous_bridge::NervousBridge;
+use crate::deepbrain::sona_bridge::SonaBridge;
 
 /// Goal tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,8 +45,10 @@ pub(crate) struct Belief {
 pub struct CognitiveEngine {
     /// Native memory system
     pub memory: Arc<NativeMemory>,
-    /// Native learner
-    pub learner: Arc<NativeLearner>,
+    /// SONA adaptive learning engine (replaces Q-learning NativeLearner)
+    pub sona: Arc<SonaBridge>,
+    /// Bio-inspired nervous system (Hopfield, routing, predictive coding)
+    pub nervous: Arc<NervousBridge>,
     /// Thought stream
     thoughts: RwLock<Vec<Thought>>,
     /// Goals
@@ -66,12 +69,35 @@ impl CognitiveEngine {
     /// Create a new cognitive engine
     pub fn new(config: Option<CognitiveConfig>) -> Self {
         let cfg = config.unwrap_or_default();
-        let dimensions = cfg.dimensions;
-        let action_count = 100;
+        let dim = cfg.dimensions as usize;
 
         Self {
-            memory: Arc::new(NativeMemory::new(dimensions)),
-            learner: Arc::new(NativeLearner::new(dimensions, action_count)),
+            memory: Arc::new(NativeMemory::new(cfg.dimensions)),
+            sona: Arc::new(SonaBridge::with_dim(dim)),
+            nervous: Arc::new(NervousBridge::new()),
+            thoughts: RwLock::new(Vec::with_capacity(1000)),
+            goals: RwLock::new(Vec::new()),
+            beliefs: RwLock::new(Vec::new()),
+            config: RwLock::new(cfg),
+            running: AtomicBool::new(false),
+            cycle_count: AtomicU64::new(0),
+            start_time: now_millis(),
+        }
+    }
+
+    /// Create a cognitive engine with all external dependencies injected.
+    pub fn with_all(
+        config: Option<CognitiveConfig>,
+        store: std::sync::Arc<crate::deepbrain::vector_store::DeepBrainVectorStore>,
+        sona: Arc<SonaBridge>,
+        nervous: Arc<NervousBridge>,
+    ) -> Self {
+        let cfg = config.unwrap_or_default();
+
+        Self {
+            memory: Arc::new(NativeMemory::with_vector_store(cfg.dimensions, store)),
+            sona,
+            nervous,
             thoughts: RwLock::new(Vec::with_capacity(1000)),
             goals: RwLock::new(Vec::new()),
             beliefs: RwLock::new(Vec::new()),
@@ -91,6 +117,13 @@ impl CognitiveEngine {
         importance: Option<f64>,
     ) -> Result<String, String> {
         let imp = importance.unwrap_or(0.5);
+
+        // Store pattern in Hopfield for associative recall
+        self.nervous.hopfield_store(&vector);
+
+        // Update predictive model with this new input
+        self.nervous.update_prediction(&vector);
+
         self.memory
             .store_f32(content, vector, memory_type, imp)
     }
@@ -151,52 +184,60 @@ impl CognitiveEngine {
             .collect())
     }
 
-    /// Learn from an experience
+    /// Learn from an experience by recording a SONA trajectory.
+    ///
+    /// The state/next_state f64 vectors are converted to f32 and recorded as a
+    /// trajectory. The reward is mapped to a quality signal in [0.0, 1.0].
     pub fn learn(
         &self,
         state: Vec<f64>,
-        action: u32,
+        _action: u32,
         reward: f64,
         next_state: Vec<f64>,
-        done: bool,
+        _done: bool,
     ) -> Result<LearnResult, String> {
-        use crate::brain::types::Experience;
+        let state_f32: Vec<f32> = state.iter().map(|&x| x as f32).collect();
+        let next_f32: Vec<f32> = next_state.iter().map(|&x| x as f32).collect();
 
-        let experience = Experience {
-            state,
-            action,
-            reward,
-            next_state,
-            done,
-        };
+        // Map reward to quality in [0, 1]: shift from [-1, 1] to [0, 1]
+        let quality = ((reward + 1.0) / 2.0).clamp(0.0, 1.0) as f32;
 
-        let outcome = self.learner.learn(experience)?;
+        self.sona.record_trajectory(&state_f32, &next_f32, quality);
 
         let thought = self.generate_thought(
-            if outcome.success {
+            if reward > 0.0 {
                 ThoughtType::Evaluation
             } else {
                 ThoughtType::Reflection
             },
             format!(
-                "Learned from experience: reward={:.2}, td_error={:.2}",
-                outcome.reward, outcome.td_error
+                "SONA trajectory recorded: reward={:.2}, quality={:.2}",
+                reward, quality
             ),
-            outcome.reward.abs().min(1.0),
+            reward.abs().min(1.0),
         );
 
         Ok(LearnResult {
-            success: outcome.success,
-            reward: outcome.reward,
-            td_error: outcome.td_error,
+            success: reward > 0.0,
+            reward,
+            td_error: 0.0, // No TD error in SONA's continuous learning
             thought_id: thought.id,
-            insights: outcome.insights,
+            insights: vec![],
         })
     }
 
-    /// Select an action for a given state
+    /// Select an action for a given state using SONA pattern matching.
+    ///
+    /// Returns the index of the best-matching pattern (mod 100) or 0 if none found.
     pub fn act(&self, state: Vec<f64>) -> u32 {
-        self.learner.select_action(state)
+        let state_f32: Vec<f32> = state.iter().map(|&x| x as f32).collect();
+        let patterns = self.sona.find_patterns(&state_f32, 1);
+        if let Some(p) = patterns.first() {
+            // Convert quality to a pseudo-action index
+            ((p.avg_quality * 100.0) as u32) % 100
+        } else {
+            0
+        }
     }
 
     /// Think - process input and generate response (with pre-computed embedding)
@@ -205,13 +246,47 @@ impl CognitiveEngine {
         input: &str,
         embedding: &[f32],
     ) -> Result<ThinkResult, String> {
+        // Predictive coding: check if this query is novel enough to process
+        let is_novel = self.nervous.should_process(embedding);
+
+        // Compute novelty score via dentate gyrus sparse encoding
+        let novelty = self.nervous.novelty_score(embedding);
+
+        // Recall from vector store
         let memories = self.recall_f32(embedding, Some(5), None)?;
 
-        let thought = self.generate_thought(
-            ThoughtType::Inference,
-            format!("Processing: {}", &input[..input.len().min(100)]),
-            0.7,
-        );
+        // Augment with Hopfield associative retrieval (pattern completion)
+        if let Some((hopfield_pattern, sim)) = self.nervous.hopfield_retrieve(embedding) {
+            // If Hopfield finds a strong match not in HNSW results, it suggests
+            // an associative connection that pure cosine similarity might miss.
+            if sim > 0.5 {
+                // Record the associative retrieval as a SONA trajectory
+                self.sona.record_query(embedding, sim.min(1.0));
+            }
+            let _ = hopfield_pattern; // Pattern used for SONA quality signal
+        }
+
+        // Update predictive model
+        self.nervous.update_prediction(embedding);
+
+        let thought = {
+            let t = self.generate_thought(
+                ThoughtType::Inference,
+                format!(
+                    "Processing{} (novelty={:.2}): {}",
+                    if is_novel { " (novel)" } else { "" },
+                    novelty,
+                    &input[..input.len().min(80)]
+                ),
+                if is_novel { 0.8 } else { 0.6 },
+            );
+            // Patch the thought's novelty field with the dentate gyrus score
+            let mut thoughts = self.thoughts.write();
+            if let Some(last) = thoughts.last_mut() {
+                last.novelty = novelty as f64;
+            }
+            t
+        };
 
         let response = if memories.is_empty() {
             "No relevant information found in memory.".to_string()
@@ -346,13 +421,15 @@ impl CognitiveEngine {
     /// Self-improve - analyze and adapt
     pub fn evolve(&self) -> EvolutionResult {
         let mut adaptations = Vec::new();
-        let improvements = Vec::new();
+        let mut improvements = Vec::new();
 
-        let learner_stats = self.learner.stats();
+        let sona_stats = self.sona.stats();
+        let nervous_stats = self.nervous.stats();
 
-        if learner_stats.trend < -0.05 {
-            self.learner.explore();
-            adaptations.push("Increased exploration due to declining performance".to_string());
+        // If too many trajectories are being dropped, force a learning cycle
+        if sona_stats.trajectories_dropped > 0 {
+            let msg = self.sona.force_learn();
+            adaptations.push(format!("Forced SONA learning cycle: {}", msg));
         }
 
         let memory_stats = self.memory.stats();
@@ -365,11 +442,36 @@ impl CognitiveEngine {
             ));
         }
 
+        // Report Hopfield capacity utilization
+        if nervous_stats.hopfield_capacity > 0 {
+            let utilization =
+                nervous_stats.hopfield_patterns as f64 / nervous_stats.hopfield_capacity as f64;
+            if utilization > 0.8 {
+                adaptations.push(format!(
+                    "Hopfield near capacity: {}/{} patterns ({:.0}%)",
+                    nervous_stats.hopfield_patterns,
+                    nervous_stats.hopfield_capacity,
+                    utilization * 100.0
+                ));
+            }
+        }
+
+        // Report neural synchronization improvements
+        if nervous_stats.router_sync > 0.7 {
+            improvements.push(format!(
+                "Neural sync: {:.2} — cognitive modules well-coordinated",
+                nervous_stats.router_sync
+            ));
+        }
+
         let thought = self.generate_thought(
             ThoughtType::Reflection,
             format!(
-                "Self-analysis: {} memories, {} q-states, trend={:.3}",
-                memory_stats.total_memories, learner_stats.q_table_size, learner_stats.trend
+                "Self-analysis: {} memories, {} SONA patterns, {} Hopfield patterns, sync={:.2}",
+                memory_stats.total_memories,
+                sona_stats.patterns_stored,
+                nervous_stats.hopfield_patterns,
+                nervous_stats.router_sync,
             ),
             0.8,
         );
@@ -386,7 +488,8 @@ impl CognitiveEngine {
     /// Introspect - get internal state
     pub fn introspect(&self) -> IntrospectionResult {
         let memory_stats = self.memory.stats();
-        let learner_stats = self.learner.stats();
+        let sona_stats = self.sona.stats();
+        let nervous_stats = self.nervous.stats();
         let thoughts = self.thoughts.read();
         let goals = self.goals.read();
 
@@ -395,9 +498,10 @@ impl CognitiveEngine {
             .filter(|g| g.status == GoalStatus::Active || g.status == GoalStatus::Pending)
             .count() as u32;
 
-        let trend = if learner_stats.trend > 0.05 {
+        // Derive trend from SONA pattern growth + neural sync
+        let trend = if sona_stats.patterns_stored > 10 && nervous_stats.router_sync > 0.5 {
             "improving"
-        } else if learner_stats.trend < -0.05 {
+        } else if sona_stats.trajectories_dropped > 0 {
             "declining"
         } else {
             "stable"
@@ -408,26 +512,26 @@ impl CognitiveEngine {
             uptime_ms: now_millis() - self.start_time,
             total_memories: memory_stats.total_memories,
             total_thoughts: thoughts.len() as u32,
-            total_experiences: learner_stats.total_experiences as u32,
+            total_experiences: sona_stats.trajectories_buffered as u32,
             active_goals,
-            avg_reward: learner_stats.avg_reward,
+            avg_reward: nervous_stats.router_sync as f64, // Use neural sync as health signal
             learning_trend: trend.to_string(),
-            exploration_rate: learner_stats.exploration_rate,
+            exploration_rate: 0.0, // No epsilon-greedy in SONA
         }
     }
 
     /// Get statistics
     pub fn stats(&self) -> CognitiveStats {
         let memory_stats = self.memory.stats();
-        let learner_stats = self.learner.stats();
+        let sona_stats = self.sona.stats();
 
         CognitiveStats {
             total_memories: memory_stats.total_memories,
             total_thoughts: self.thoughts.read().len() as u32,
-            total_experiences: learner_stats.total_experiences as u32,
+            total_experiences: sona_stats.trajectories_buffered as u32,
             avg_importance: memory_stats.avg_importance,
-            avg_reward: learner_stats.avg_reward,
-            learning_trend: learner_stats.trend,
+            avg_reward: 0.0, // SONA doesn't track global reward
+            learning_trend: if sona_stats.patterns_stored > 0 { 1.0 } else { 0.0 },
         }
     }
 
@@ -438,12 +542,28 @@ impl CognitiveEngine {
         thoughts.iter().rev().take(n).cloned().collect()
     }
 
-    /// Run a cognitive cycle
+    /// Run a cognitive cycle (ticks SONA engine + nervous system + periodic memory consolidation)
     pub fn cycle(&self) -> CycleResult {
         self.cycle_count.fetch_add(1, Ordering::Relaxed);
 
-        let train_result = self.learner.train_batch().ok();
-        let insights = train_result.unwrap_or_default();
+        // Step the oscillatory router (dt = 60s default cycle interval)
+        self.nervous.router_step(60.0);
+
+        // Tick SONA — runs background learning if the interval has elapsed
+        let sona_msg = self.sona.tick();
+        let mut insights = Vec::new();
+        if let Some(msg) = sona_msg {
+            insights.push(msg);
+        }
+
+        // Report nervous system sync level
+        let sync = self.nervous.router_sync();
+        if sync > 0.8 {
+            insights.push(format!("Neural sync high: {:.2} — modules coherent", sync));
+        }
+
+        // Flush instant-loop MicroLoRA gradients
+        self.sona.flush();
 
         let consolidated = if self.cycle_count.load(Ordering::Relaxed) % 100 == 0 {
             Some(self.memory.consolidate())

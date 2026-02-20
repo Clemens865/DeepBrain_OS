@@ -66,15 +66,17 @@ impl super::AiProvider for ClaudeProvider {
         &self,
         prompt: &str,
         context_memories: &[RecallResult],
+        extra_context: &str,
     ) -> Result<AiResponse, String> {
         let memory_context = format_memory_context(context_memories);
 
         let system_prompt = format!(
-            "You are SuperBrain, an intelligent cognitive assistant running as a macOS app. \
-             You have access to the user's memories and knowledge base. \
-             Use the following memory context to inform your response. \
+            "You are DeepBrain, an intelligent cognitive assistant running as a macOS app. \
+             You have access to the user's memories, indexed files, and system search results. \
+             Use ALL of the following context to provide an informed, helpful response. \
              Be concise and helpful.\n\
-             {memory_context}"
+             {memory_context}\
+             {extra_context}"
         );
 
         let url = "https://api.anthropic.com/v1/messages";

@@ -20,7 +20,7 @@ export default function MemoryFeed() {
               status?.status === "healthy" ? "bg-brain-success" : "bg-brain-warning"
             }`}
           />
-          <span className="text-white text-sm font-medium">SuperBrain</span>
+          <span className="text-white text-sm font-medium">DeepBrain</span>
           <span className="text-brain-text/50 text-xs ml-auto">
             {status?.learning_trend || "initializing"}
           </span>

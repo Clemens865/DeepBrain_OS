@@ -1,4 +1,4 @@
-//! Application state management for SuperBrain
+//! Application state management for DeepBrain
 //!
 //! Wraps CognitiveEngine + EmbeddingModel + Persistence in Arc for Tauri managed state.
 
@@ -14,13 +14,19 @@ use crate::brain::embeddings::EmbeddingModel;
 use crate::brain::persistence::BrainPersistence;
 use crate::brain::types::CognitiveConfig;
 use crate::context::ContextManager;
+use crate::deepbrain::llm_bridge::LlmBridge;
+use crate::deepbrain::nervous_bridge::NervousBridge;
+use crate::deepbrain::sona_bridge::SonaBridge;
+use crate::deepbrain::vector_store::DeepBrainVectorStore;
 use crate::indexer::FileIndexer;
+use crate::indexer::email::EmailIndexer;
 
 /// Application settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
-    pub ai_provider: String,         // "ollama" | "claude" | "none"
-    pub ollama_model: String,        // e.g. "llama3.2"
+    pub ai_provider: String,         // "ollama" | "claude" | "ruvllm" | "none"
+    pub ollama_model: String,        // e.g. "llama3.1:8b"
+    pub ruvllm_model: Option<String>, // e.g. "Qwen/Qwen2.5-1.5B-Instruct" or local GGUF path
     pub claude_api_key: Option<String>,
     pub hotkey: String,              // e.g. "CmdOrCtrl+Shift+Space"
     pub indexed_folders: Vec<String>,
@@ -28,13 +34,19 @@ pub struct AppSettings {
     pub auto_start: bool,
     pub privacy_mode: bool,
     pub onboarded: bool,
+    pub api_port: Option<u16>,
+    pub api_token: Option<String>,
+    /// Email accounts to index (empty = all accounts).
+    #[serde(default)]
+    pub email_accounts: Vec<String>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             ai_provider: "ollama".to_string(),
-            ollama_model: "llama3.2".to_string(),
+            ollama_model: "llama3.1:8b".to_string(),
+            ruvllm_model: None,
             claude_api_key: None,
             hotkey: "CmdOrCtrl+Shift+Space".to_string(),
             indexed_folders: vec![],
@@ -42,6 +54,9 @@ impl Default for AppSettings {
             auto_start: false,
             privacy_mode: false,
             onboarded: false,
+            api_port: None,
+            api_token: None,
+            email_accounts: vec![],
         }
     }
 }
@@ -59,6 +74,7 @@ pub struct SystemStatus {
     pub learning_trend: String,
     pub indexed_files: u32,
     pub indexed_chunks: u32,
+    pub indexed_emails: u32,
 }
 
 /// Main application state
@@ -67,7 +83,12 @@ pub struct AppState {
     pub embeddings: Arc<EmbeddingModel>,
     pub persistence: Arc<BrainPersistence>,
     pub indexer: Arc<FileIndexer>,
+    pub email_indexer: Arc<EmailIndexer>,
     pub context: Arc<ContextManager>,
+    pub sona: Arc<SonaBridge>,
+    pub nervous: Arc<NervousBridge>,
+    pub llm: Arc<LlmBridge>,
+    pub vector_store: Arc<DeepBrainVectorStore>,
     pub ai_provider: RwLock<Option<Box<dyn AiProvider>>>,
     pub settings: RwLock<AppSettings>,
     pub shutdown: Notify,
@@ -77,10 +98,40 @@ impl AppState {
     /// Create a new application state
     pub fn new() -> Result<Self, String> {
         let persistence = BrainPersistence::new()?;
-        let engine = CognitiveEngine::new(Some(CognitiveConfig::default()));
         let embeddings = EmbeddingModel::new();
 
-        // Restore persisted memories
+        // --- Initialize DeepBrain RVF vector store ---
+        let data_dir = dirs::data_dir()
+            .ok_or("No data dir")?
+            .join("DeepBrain");
+        let vector_store = Arc::new(
+            DeepBrainVectorStore::open_or_create(&data_dir)
+                .map_err(|e| format!("Failed to open DeepBrain vector store: {}", e))?,
+        );
+        tracing::info!(
+            "DeepBrain vector store ready at {:?} ({} vectors)",
+            data_dir,
+            vector_store.status().total_vectors,
+        );
+
+        // Create shared SONA bridge
+        let sona = Arc::new(SonaBridge::new());
+
+        // Create nervous system bridge (Hopfield, routing, predictive coding)
+        let nervous = Arc::new(NervousBridge::new());
+
+        // Create local LLM bridge (ruvllm CandleBackend — model loaded on demand)
+        let llm = Arc::new(LlmBridge::new());
+
+        // Create cognitive engine with RVF-backed memory + SONA + nervous system
+        let engine = CognitiveEngine::with_all(
+            Some(CognitiveConfig::default()),
+            Arc::clone(&vector_store),
+            Arc::clone(&sona),
+            Arc::clone(&nervous),
+        );
+
+        // Restore persisted memories (metadata into DashMap, vectors already in RVF)
         match persistence.load_memories() {
             Ok(memories) => {
                 let count = memories.len();
@@ -96,17 +147,25 @@ impl AppState {
             }
         }
 
-        // Restore Q-table
-        match persistence.load_q_table() {
-            Ok(entries) => {
-                let count = entries.len();
-                engine.learner.import_q_table(entries);
-                if count > 0 {
-                    tracing::info!("Restored {} Q-table entries", count);
+        // Restore SONA patterns from blob store
+        match persistence.load_blob("sona_patterns") {
+            Ok(Some(bytes)) => {
+                match serde_json::from_slice::<Vec<crate::deepbrain::sona_bridge::SerializedPattern>>(&bytes) {
+                    Ok(patterns) => {
+                        let count = patterns.len();
+                        sona.import_patterns(&patterns);
+                        if count > 0 {
+                            tracing::info!("Restored {} SONA patterns", count);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize SONA patterns: {}", e);
+                    }
                 }
             }
+            Ok(None) => {}
             Err(e) => {
-                tracing::warn!("Failed to load Q-table: {}", e);
+                tracing::warn!("Failed to load SONA patterns: {}", e);
             }
         }
 
@@ -116,38 +175,74 @@ impl AppState {
             _ => AppSettings::default(),
         };
 
-        // Load Claude API key from Keychain (overrides any value in settings)
+        // Load secrets from Keychain (overrides any value in settings)
         if let Ok(Some(key)) = crate::keychain::get_secret("claude_api_key") {
             settings.claude_api_key = Some(key);
             tracing::info!("Loaded Claude API key from Keychain");
+        }
+        if let Ok(Some(token)) = crate::keychain::get_secret("api_token") {
+            settings.api_token = Some(token);
+            tracing::info!("Loaded API token from Keychain");
         }
 
         engine.set_running(true);
 
         let embeddings = Arc::new(embeddings);
 
-        // Initialize file indexer
+        // Initialize file indexer with shared RVF vector store
         let index_db = dirs::data_dir()
             .ok_or("No data dir")?
-            .join("SuperBrain")
+            .join("DeepBrain")
             .join("files.db");
-        let indexer = FileIndexer::new(index_db, embeddings.clone())?;
+        let indexer = FileIndexer::with_vector_store(
+            index_db.clone(),
+            embeddings.clone(),
+            Arc::clone(&vector_store),
+        )?;
+
+        // Initialize email indexer with shared RVF vector store
+        let email_indexer = EmailIndexer::with_vector_store(
+            index_db,
+            embeddings.clone(),
+            Arc::clone(&vector_store),
+        )?;
+
+        // Configure email account filter from settings
+        if !settings.email_accounts.is_empty() {
+            email_indexer.set_allowed_accounts(settings.email_accounts.clone());
+            tracing::info!("Email indexer limited to accounts: {:?}", settings.email_accounts);
+        }
 
         let ai_provider = Self::build_ai_provider(&settings);
+
+        let persistence = Arc::new(persistence);
+
+        let indexer = Arc::new(indexer);
+
+        // No HNSW index build needed — RvfStore boots from its own manifest.
+        tracing::info!("File indexer ready (RVF-backed)");
 
         Ok(Self {
             engine: Arc::new(engine),
             embeddings,
-            persistence: Arc::new(persistence),
-            indexer: Arc::new(indexer),
+            persistence,
+            indexer,
+            email_indexer: Arc::new(email_indexer),
             context: Arc::new(ContextManager::new()),
+            sona,
+            nervous,
+            llm,
+            vector_store,
             ai_provider: RwLock::new(ai_provider),
             settings: RwLock::new(settings),
             shutdown: Notify::new(),
         })
     }
 
-    /// Build an AI provider from current settings
+    /// Build an AI provider from current settings.
+    ///
+    /// For "ruvllm", the LlmBridge must have a model loaded separately
+    /// (via the `load_local_model` command). This returns None if no model is loaded.
     pub fn build_ai_provider(settings: &AppSettings) -> Option<Box<dyn AiProvider>> {
         match settings.ai_provider.as_str() {
             "ollama" => Some(Box::new(
@@ -161,14 +256,32 @@ impl AppState {
                 }
                 None
             }
+            // "ruvllm" is handled specially — uses the shared LlmBridge
+            // which implements AiProvider when wrapped in Arc.
+            // Caller should use `self.build_ai_provider_with_llm()` instead.
             _ => None,
+        }
+    }
+
+    /// Build an AI provider, including support for the local LLM backend.
+    pub fn build_ai_provider_with_llm(&self) -> Option<Box<dyn AiProvider>> {
+        let settings = self.settings.read();
+        match settings.ai_provider.as_str() {
+            "ruvllm" => {
+                if self.llm.is_loaded() {
+                    Some(Box::new(Arc::clone(&self.llm)))
+                } else {
+                    tracing::warn!("ruvllm selected but no model loaded");
+                    None
+                }
+            }
+            _ => Self::build_ai_provider(&settings),
         }
     }
 
     /// Refresh the AI provider (call after settings change)
     pub fn refresh_ai_provider(&self) {
-        let settings = self.settings.read().clone();
-        *self.ai_provider.write() = Self::build_ai_provider(&settings);
+        *self.ai_provider.write() = self.build_ai_provider_with_llm();
     }
 
     /// Persist current state to disk
@@ -177,16 +290,25 @@ impl AppState {
         let nodes = self.engine.memory.all_nodes();
         self.persistence.store_memories_batch(&nodes)?;
 
-        // Save Q-table
-        let q_entries = self.engine.learner.export_q_table();
-        self.persistence.store_q_table(&q_entries)?;
-
         // Save settings
         let settings = self.settings.read().clone();
         let settings_json =
             serde_json::to_string(&settings).map_err(|e| format!("Serialize error: {}", e))?;
         self.persistence
             .store_config("app_settings", &settings_json)?;
+
+        // Save SONA learned patterns
+        let patterns = self.sona.export_patterns();
+        if !patterns.is_empty() {
+            match serde_json::to_vec(&patterns) {
+                Ok(bytes) => {
+                    let _ = self.persistence.store_blob("sona_patterns", &bytes);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to serialize SONA patterns: {}", e);
+                }
+            }
+        }
 
         tracing::info!("State flushed to disk ({} memories)", nodes.len());
         Ok(())

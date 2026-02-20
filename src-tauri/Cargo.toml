@@ -1,16 +1,17 @@
 [package]
-name = "superbrain-app"
-version = "0.1.0"
+name = "deepbrain-app"
+version = "0.2.0"
 edition = "2021"
-description = "SuperBrain - Intelligent macOS cognitive layer"
+description = "DeepBrain - Cognitive memory layer with RVF crash-safe vector storage"
 license = "MIT"
+rust-version = "1.87"
 
 [lib]
-name = "superbrain_app_lib"
+name = "deepbrain_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
-name = "superbrain-app"
+name = "deepbrain-app"
 path = "src/main.rs"
 
 [dependencies]
@@ -47,6 +48,10 @@ bincode = "1"
 # Random and math
 rand = "0.8"
 
+# HTTP API
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
 # Utilities
 thiserror = "2"
 tracing = "0.1"
@@ -60,7 +65,16 @@ battery = "0.7.8"
 ort = "2.0.0-rc.11"
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 ndarray = "0.17.2"
+hnsw_rs = "0.3"
 tauri-plugin-updater = "2.10.0"
+
+# RuVector RVF storage (path deps to local source)
+rvf-runtime = { path = "../../ruvector-main/crates/rvf/rvf-runtime" }
+rvf-types = { path = "../../ruvector-main/crates/rvf/rvf-types", features = ["std"] }
+rvf-crypto = { path = "../../ruvector-main/crates/rvf/rvf-crypto" }
+ruvector-sona = { path = "../../ruvector-main/crates/sona", default-features = false, features = ["serde-support"] }
+ruvector-nervous-system = { path = "../../ruvector-main/crates/ruvector-nervous-system", default-features = false }
+ruvllm = { path = "../../ruvector-main/crates/ruvllm", default-features = false, features = ["async-runtime", "candle", "gguf-mmap", "parallel"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

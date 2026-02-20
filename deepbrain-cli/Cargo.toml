@@ -1,0 +1,17 @@
+[package]
+name = "deepbrain-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for DeepBrain cognitive engine"
+license = "MIT"
+
+[[bin]]
+name = "deepbrain"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

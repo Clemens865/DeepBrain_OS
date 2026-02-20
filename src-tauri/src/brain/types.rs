@@ -1,8 +1,8 @@
-//! Core type definitions for SuperBrain (Tauri port - NAPI removed)
+//! Core type definitions for DeepBrain (Tauri port - NAPI removed)
 
 use serde::{Deserialize, Serialize};
 
-/// Memory types supported by SuperBrain
+/// Memory types supported by DeepBrain
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum MemoryType {
     Episodic,

@@ -1,4 +1,4 @@
-//! High-performance learning algorithms for SuperBrain (Tauri port)
+//! High-performance learning algorithms for DeepBrain (Tauri port)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

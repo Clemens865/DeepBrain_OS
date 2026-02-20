@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { useAppStore } from "../store/appStore";
 
-type Tab = "response" | "memories" | "files";
+type Tab = "response" | "memories" | "files" | "email" | "system";
 
 export default function ResultsList() {
   const [activeTab, setActiveTab] = useState<Tab>("response");
   const { results, isSearching } = useAppStore();
-  const { memories, files, thinkResult } = results;
+  const { memories, files, spotlight, emails, semanticEmails, thinkResult } = results;
 
   return (
     <div className="flex flex-col flex-1 overflow-hidden">
@@ -29,6 +29,18 @@ export default function ResultsList() {
           onClick={() => setActiveTab("files")}
           label="Files"
           count={files.length}
+        />
+        <TabButton
+          active={activeTab === "email"}
+          onClick={() => setActiveTab("email")}
+          label="Email"
+          count={semanticEmails.length + emails.length}
+        />
+        <TabButton
+          active={activeTab === "system"}
+          onClick={() => setActiveTab("system")}
+          label="System"
+          count={spotlight.length}
         />
       </div>
 
@@ -115,6 +127,120 @@ export default function ResultsList() {
             )}
           </div>
         )}
+
+        {!isSearching && activeTab === "email" && (
+          <div className="space-y-2 animate-fade-in">
+            {semanticEmails.length === 0 && emails.length === 0 ? (
+              <div className="text-brain-text/50 text-sm text-center py-8">
+                No matching emails found
+              </div>
+            ) : (
+              <>
+                {/* Semantic results (from indexed/embedded emails) */}
+                {semanticEmails.length > 0 && (
+                  <>
+                    <div className="text-[10px] uppercase tracking-wider text-brain-text/30 px-1 pt-1">
+                      Indexed emails ({semanticEmails.length})
+                    </div>
+                    {semanticEmails.map((email, i) => (
+                      <div
+                        key={`sem-${i}`}
+                        className="bg-brain-surface rounded-lg p-3 border border-brain-border hover:border-blue-500/30 transition-colors cursor-default"
+                      >
+                        <div className="flex items-center gap-2 mb-1">
+                          <svg className="w-3.5 h-3.5 text-blue-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                          </svg>
+                          <span className="text-white text-sm font-medium truncate">{email.subject}</span>
+                          <span className="ml-auto text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 font-medium">
+                            {(email.similarity * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-3 mt-1 text-xs text-brain-text/50 ml-5.5">
+                          <span className="truncate">{email.sender}</span>
+                          <span className="text-brain-text/30">{email.mailbox}</span>
+                        </div>
+                        {email.chunk && (
+                          <p className="text-brain-text/40 text-xs leading-relaxed line-clamp-2 ml-5.5 mt-1">
+                            {email.chunk}
+                          </p>
+                        )}
+                        <div className="text-brain-text/30 text-[10px] ml-5.5 mt-1">
+                          {email.date}
+                        </div>
+                      </div>
+                    ))}
+                  </>
+                )}
+
+                {/* Live mail results (from AppleScript search) */}
+                {emails.length > 0 && (
+                  <>
+                    <div className="text-[10px] uppercase tracking-wider text-brain-text/30 px-1 pt-2">
+                      Live search ({emails.length})
+                    </div>
+                    {emails.map((email, i) => (
+                      <div
+                        key={`live-${email.message_id}-${i}`}
+                        className="bg-brain-surface rounded-lg p-3 border border-brain-border hover:border-blue-500/30 transition-colors cursor-default"
+                      >
+                        <div className="flex items-center gap-2 mb-1">
+                          <svg className="w-3.5 h-3.5 text-blue-400/60 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                          </svg>
+                          <span className="text-white text-sm font-medium truncate">{email.subject}</span>
+                        </div>
+                        <div className="flex items-center gap-3 mt-1 text-xs text-brain-text/50 ml-5.5">
+                          <span className="truncate">{email.sender}</span>
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400/60 font-medium">
+                            {email.account}
+                          </span>
+                        </div>
+                        {email.preview && (
+                          <p className="text-brain-text/40 text-xs leading-relaxed line-clamp-2 ml-5.5 mt-1">
+                            {email.preview}
+                          </p>
+                        )}
+                        <div className="text-brain-text/30 text-[10px] ml-5.5 mt-1">
+                          {email.date}
+                        </div>
+                      </div>
+                    ))}
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {!isSearching && activeTab === "system" && (
+          <div className="space-y-2 animate-fade-in">
+            {spotlight.length === 0 ? (
+              <div className="text-brain-text/50 text-sm text-center py-8">
+                No system results found
+              </div>
+            ) : (
+              spotlight.map((item, i) => (
+                <div
+                  key={`${item.path}-${i}`}
+                  className="bg-brain-surface rounded-lg p-3 border border-brain-border hover:border-brain-accent/30 transition-colors cursor-default"
+                  onClick={() => navigator.clipboard.writeText(item.path)}
+                >
+                  <div className="flex items-center gap-2 mb-1">
+                    <svg className="w-3.5 h-3.5 text-brain-text/40 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                    </svg>
+                    <span className="text-white text-sm font-medium truncate">{item.name}</span>
+                    <SystemKindBadge kind={item.kind} />
+                  </div>
+                  <div className="flex items-center gap-3 mt-1 text-xs text-brain-text/50 ml-5.5">
+                    <span className="truncate">{item.path}</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -145,6 +271,27 @@ function TabButton({
         <span className="ml-1.5 text-[10px] opacity-60">{count}</span>
       )}
     </button>
+  );
+}
+
+function SystemKindBadge({ kind }: { kind: string }) {
+  const colors: Record<string, string> = {
+    email: "bg-blue-500/20 text-blue-400",
+    document: "bg-green-500/20 text-green-400",
+    pdf: "bg-red-500/20 text-red-400",
+    code: "bg-brain-accent/20 text-brain-accent",
+    image: "bg-pink-500/20 text-pink-400",
+    spreadsheet: "bg-emerald-500/20 text-emerald-400",
+    presentation: "bg-orange-500/20 text-orange-400",
+    audio: "bg-violet-500/20 text-violet-400",
+    video: "bg-cyan-500/20 text-cyan-400",
+    file: "bg-gray-500/20 text-gray-400",
+  };
+
+  return (
+    <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${colors[kind] || colors.file}`}>
+      {kind}
+    </span>
   );
 }
 

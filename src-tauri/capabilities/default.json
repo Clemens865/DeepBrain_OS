@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Default capabilities for SuperBrain",
+  "description": "Default capabilities for DeepBrain",
   "windows": ["main"],
   "permissions": [
     "core:default",

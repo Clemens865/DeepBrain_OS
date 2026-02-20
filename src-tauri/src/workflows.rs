@@ -1,4 +1,4 @@
-//! Workflow automation for SuperBrain
+//! Workflow automation for DeepBrain
 //!
 //! Built-in actions that combine multiple cognitive operations.
 

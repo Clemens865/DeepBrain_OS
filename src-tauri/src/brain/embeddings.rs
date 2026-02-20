@@ -1,4 +1,4 @@
-//! Embedding model for SuperBrain
+//! Embedding model for DeepBrain
 //!
 //! Supports:
 //! - ONNX all-MiniLM-L6-v2 (384-dim, local, fast)
@@ -45,13 +45,13 @@ impl EmbeddingModel {
     pub fn new() -> Self {
         let model_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("SuperBrain")
+            .join("DeepBrain")
             .join("models");
 
         Self {
             provider: RwLock::new(EmbeddingProvider::Hash),
             onnx_session: parking_lot::Mutex::new(None),
-            ollama_url: "http://localhost:11434".to_string(),
+            ollama_url: "http://127.0.0.1:11434".to_string(),
             ollama_model: "nomic-embed-text".to_string(),
             model_dir,
         }

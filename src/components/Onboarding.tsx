@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../services/backend";
 import { useAppStore } from "../store/appStore";
 
 interface OllamaStatus {
@@ -63,7 +63,7 @@ export default function Onboarding() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
             </svg>
           </div>
-          <h1 className="text-white text-xl font-semibold mb-2">Welcome to SuperBrain</h1>
+          <h1 className="text-white text-xl font-semibold mb-2">Welcome to DeepBrain</h1>
           <p className="text-brain-text/60 text-sm mb-1">
             Your intelligent cognitive layer for macOS.
           </p>
@@ -83,7 +83,7 @@ export default function Onboarding() {
         <div className="flex flex-col flex-1 px-8 py-6 animate-fade-in">
           <h2 className="text-white text-lg font-semibold mb-1">AI Provider</h2>
           <p className="text-brain-text/50 text-xs mb-5">
-            SuperBrain can use a local or cloud AI for enhanced responses.
+            DeepBrain can use a local or cloud AI for enhanced responses.
           </p>
 
           {/* Ollama status */}
@@ -154,14 +154,14 @@ export default function Onboarding() {
           </div>
           <h2 className="text-white text-lg font-semibold mb-2">You're All Set!</h2>
           <p className="text-brain-text/50 text-xs mb-2 max-w-[280px]">
-            Press <span className="text-brain-accent font-medium">Cmd+Shift+Space</span> anytime to open SuperBrain.
+            Press <span className="text-brain-accent font-medium">Cmd+Shift+Space</span> anytime to open DeepBrain.
           </p>
           <p className="text-brain-text/40 text-[10px] mb-8 max-w-[250px]">
             {indexing
               ? "Indexing your files..."
               : indexCount !== null
               ? `Indexed ${indexCount} files from your Documents, Desktop, and Downloads.`
-              : "Click below to index your files and start using SuperBrain."}
+              : "Click below to index your files and start using DeepBrain."}
           </p>
           <button
             onClick={finish}
@@ -172,7 +172,7 @@ export default function Onboarding() {
                 : "bg-brain-accent hover:bg-brain-accent/80"
             }`}
           >
-            {indexing ? "Indexing..." : "Start Using SuperBrain"}
+            {indexing ? "Indexing..." : "Start Using DeepBrain"}
           </button>
         </div>
       )}
