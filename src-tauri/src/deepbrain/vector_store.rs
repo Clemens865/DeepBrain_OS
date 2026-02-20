@@ -207,10 +207,31 @@ impl DeepBrainVectorStore {
     }
 
     /// Open an existing store or create a new one if it doesn't exist.
+    ///
+    /// If the existing store is corrupt (e.g. missing manifest), it is renamed
+    /// to `.corrupt_<timestamp>` and a fresh store is created.
     pub fn open_or_create(data_dir: &Path) -> Result<Self, DeepBrainError> {
         let rvtext_path = data_dir.join("knowledge.rvtext");
         if rvtext_path.exists() {
-            Self::open(data_dir)
+            match Self::open(data_dir) {
+                Ok(store) => Ok(store),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to open existing RVF store, creating fresh: {}",
+                        e
+                    );
+                    // Rename corrupt files so we don't lose data
+                    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+                    let corrupt_name = format!("knowledge.rvtext.corrupt_{}", ts);
+                    let _ = std::fs::rename(&rvtext_path, data_dir.join(&corrupt_name));
+                    let idmap_path = data_dir.join("deepbrain_ids.db");
+                    if idmap_path.exists() {
+                        let idmap_corrupt = format!("deepbrain_ids.db.corrupt_{}", ts);
+                        let _ = std::fs::rename(&idmap_path, data_dir.join(&idmap_corrupt));
+                    }
+                    Self::create(data_dir)
+                }
+            }
         } else {
             Self::create(data_dir)
         }
