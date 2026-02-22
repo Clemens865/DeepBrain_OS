@@ -105,6 +105,30 @@ export interface VerifyResult {
   };
 }
 
+// ---- Knowledge Graph / GNN / Compression types ----
+
+export interface GraphStats {
+  node_count: number;
+  edge_count: number;
+  hyperedge_count: number;
+}
+
+export interface RankedResult {
+  id: string;
+  content: string;
+  vector_score: number;
+  gnn_score: number;
+  blended_score: number;
+}
+
+export interface CompressionStats {
+  total_memories: number;
+  hot_count: number;
+  warm_count: number;
+  cold_count: number;
+  estimated_savings_pct: number;
+}
+
 export interface SpotlightResult {
   path: string;
   name: string;
@@ -181,7 +205,8 @@ export type BrowseCategory =
   | "clipboard"
   | "spotlight"
   | "email"
-  | "status";
+  | "status"
+  | "knowledge-graph";
 
 export interface MemoryBrowseItem {
   id: string;
@@ -284,6 +309,8 @@ interface AppState {
   sonaStats: SonaStats | null;
   nervousStats: NervousStats | null;
   llmStatus: LlmStatus | null;
+  graphStats: GraphStats | null;
+  compressionStats: CompressionStats | null;
   verifyResult: VerifyResult | null;
   verifying: boolean;
 
@@ -386,6 +413,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   sonaStats: null,
   nervousStats: null,
   llmStatus: null,
+  graphStats: null,
+  compressionStats: null,
   verifyResult: null,
   verifying: false,
 
@@ -657,17 +686,28 @@ export const useAppStore = create<AppState>((set, get) => ({
           set({ browseItems: [], browseLoading: false });
         }
       } else if (browseCategory === "email") {
-        // If there's a search query, search; otherwise show recent emails
+        // If there's a search query, use semantic search; otherwise show cached recent emails.
+        // Both paths use SQLite-cached data (no live AppleScript).
         const q = get().mailQuery || get().browseFilterText;
         if (q) {
-          const items = await invoke<MailSearchResult[]>("mail_search", { query: q, field: "all", limit: 50 });
+          // Semantic search — returns {subject, sender, date, mailbox, chunk, similarity}
+          const raw = await invoke<any[]>("search_emails", { query: q, limit: 50 });
+          const items: MailSearchResult[] = raw.map((r) => ({
+            subject: r.subject,
+            sender: r.sender,
+            date: r.date,
+            preview: (r.chunk || "").slice(0, 200),
+            account: "",
+            mailbox: r.mailbox || "",
+            message_id: 0,
+          }));
           set({
             browseItems: items.map((d) => ({ kind: "email" as const, data: d })),
             mailResults: items,
             browseLoading: false,
           });
         } else {
-          // Auto-load recent emails from inbox
+          // Recent indexed emails from SQLite cache (instant, no AppleScript)
           const items = await invoke<MailSearchResult[]>("get_recent_emails", { limit: 30 }).catch(() => [] as MailSearchResult[]);
           set({
             browseItems: items.map((d) => ({ kind: "email" as const, data: d })),
@@ -818,13 +858,15 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   loadDashboardData: async () => {
     try {
-      const [storageMetrics, sonaStats, nervousStats, llmStatus] = await Promise.all([
+      const [storageMetrics, sonaStats, nervousStats, llmStatus, graphStats, compressionStats] = await Promise.all([
         invoke<StorageMetrics>("get_storage_metrics").catch(() => null),
         invoke<SonaStats>("get_sona_stats").catch(() => null),
         invoke<NervousStats>("get_nervous_stats").catch(() => null),
         invoke<LlmStatus>("local_model_status").catch(() => null),
+        invoke<GraphStats>("graph_stats").catch(() => null),
+        invoke<CompressionStats>("compression_scan").catch(() => null),
       ]);
-      set({ storageMetrics, sonaStats, nervousStats, llmStatus });
+      set({ storageMetrics, sonaStats, nervousStats, llmStatus, graphStats, compressionStats });
     } catch (error) {
       console.error("Failed to load dashboard data:", error);
     }

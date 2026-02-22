@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(dead_code)]
 
+mod activity;
 mod ai;
 mod api;
 mod autostart;
@@ -65,14 +66,19 @@ pub fn run() {
             tray::setup_tray(app.handle())?;
 
             // Setup global shortcut (Cmd+Shift+Space)
-            use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+            use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
             let shortcut: Shortcut = "CmdOrCtrl+Shift+Space"
                 .parse()
                 .expect("Failed to parse shortcut");
 
             let handle = app.handle().clone();
-            app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, _event| {
-                overlay::toggle(&handle);
+            app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, event| {
+                // Only toggle on key press, not release.
+                // Without this check, the window shows on press then immediately
+                // hides on release, making it appear to "flash".
+                if event.state == ShortcutState::Pressed {
+                    overlay::toggle(&handle);
+                }
             })?;
 
             // Start file watcher for indexed directories
@@ -105,14 +111,43 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         // Keep _watcher alive by moving it into the task
                         let _keep_alive = _watcher;
-                        while let Some(change) = rx.recv().await {
-                            let path = match &change {
-                                indexer::watcher::FileChange::Created(p)
-                                | indexer::watcher::FileChange::Modified(p) => Some(p.clone()),
-                                indexer::watcher::FileChange::Deleted(_) => None,
+
+                        // Debounce: collect changed paths and flush after a quiet window.
+                        // This coalesces bursts of events for the same file (macOS often
+                        // emits 3-6 events per file change).
+                        let mut pending = std::collections::HashSet::<std::path::PathBuf>::new();
+                        let debounce = tokio::time::Duration::from_secs(2);
+
+                        loop {
+                            // Wait for the first event (blocking)
+                            let change = match rx.recv().await {
+                                Some(c) => c,
+                                None => break,
                             };
-                            if let Some(path) = path {
-                                tracing::debug!("File changed, re-indexing: {:?}", path);
+                            if let indexer::watcher::FileChange::Created(p)
+                                | indexer::watcher::FileChange::Modified(p) = change
+                            {
+                                pending.insert(p);
+                            }
+
+                            // Drain all events that arrive within the debounce window
+                            loop {
+                                match tokio::time::timeout(debounce, rx.recv()).await {
+                                    Ok(Some(change)) => {
+                                        if let indexer::watcher::FileChange::Created(p)
+                                            | indexer::watcher::FileChange::Modified(p) = change
+                                        {
+                                            pending.insert(p);
+                                        }
+                                    }
+                                    _ => break, // Timeout or channel closed
+                                }
+                            }
+
+                            // Flush all unique pending paths
+                            let batch: Vec<_> = pending.drain().collect();
+                            tracing::debug!("Debounced watcher: indexing {} files", batch.len());
+                            for path in batch {
                                 let _ = idx.index_file(&path).await;
                             }
                         }
@@ -133,7 +168,15 @@ pub fn run() {
                 .state::<Arc<AppState>>()
                 .persistence
                 .clone();
+            let vector_store = app
+                .state::<Arc<AppState>>()
+                .vector_store
+                .clone();
             let cycle_handle = app.handle().clone();
+            let rvtext_path = dirs::data_dir()
+                .expect("No data dir")
+                .join("DeepBrain")
+                .join("knowledge.rvtext");
 
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -157,6 +200,37 @@ pub fn run() {
                     let _ = persistence.store_memories_batch(&nodes);
                     tracing::debug!("Background cycle completed (battery={})", on_battery);
 
+                    // Auto-compaction: reclaim dead space when ratio exceeds 30%
+                    let metrics = vector_store.metrics();
+                    if metrics.dead_space_ratio > 0.3 {
+                        match vector_store.compact() {
+                            Ok(bytes) => tracing::info!("Auto-compaction reclaimed {} bytes", bytes),
+                            Err(e) => tracing::warn!("Auto-compaction failed: {}", e),
+                        }
+                    }
+
+                    // File size watchdog: force compaction if .rvtext exceeds 2 GB
+                    if let Ok(meta) = std::fs::metadata(&rvtext_path) {
+                        let size_gb = meta.len() as f64 / (1024.0 * 1024.0 * 1024.0);
+                        if size_gb > 2.0 {
+                            tracing::warn!("knowledge.rvtext is {:.1} GB — forcing compaction", size_gb);
+                            match vector_store.compact() {
+                                Ok(bytes) => tracing::info!("Emergency compaction reclaimed {} bytes", bytes),
+                                Err(e) => tracing::error!("Emergency compaction failed: {}", e),
+                            }
+                            // Check if still over limit after compaction
+                            if let Ok(meta) = std::fs::metadata(&rvtext_path) {
+                                let size_gb = meta.len() as f64 / (1024.0 * 1024.0 * 1024.0);
+                                if size_gb > 2.0 {
+                                    tracing::error!(
+                                        "knowledge.rvtext still {:.1} GB after compaction — manual intervention needed",
+                                        size_gb
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     tray::set_status(&cycle_handle, tray::TrayStatus::Idle);
                 }
             });
@@ -175,6 +249,27 @@ pub fn run() {
                             tracing::debug!("Clipboard captured");
                         }
                     }
+                }
+            });
+
+            // Start activity observation loop (poll every 2s)
+            let activity_ref = app.state::<Arc<AppState>>().activity.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    if activity_ref.is_enabled() {
+                        activity_ref.observe_frontmost().await;
+                    }
+                }
+            });
+
+            // Start hourly activity pruning task
+            let activity_prune_ref = app.state::<Arc<AppState>>().activity.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+                    let retention = activity_prune_ref.retention_days();
+                    activity_prune_ref.prune(retention);
                 }
             });
 
@@ -217,6 +312,34 @@ pub fn run() {
                 }
             });
 
+            // One-time startup scan: index all existing files in fast local directories.
+            // Only scans Documents, Desktop, Downloads — the watcher handles iCloud
+            // and ~/ in real-time. Without this, existing content (md, code, configs)
+            // would never be indexed until manually triggered or files change.
+            let startup_indexer = app.state::<Arc<AppState>>().indexer.clone();
+            let startup_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait 45s for the app and file watcher to fully settle
+                tokio::time::sleep(tokio::time::Duration::from_secs(45)).await;
+                tracing::info!("Startup file scan beginning...");
+                tray::set_status(&startup_handle, tray::TrayStatus::Learning);
+
+                // Only scan local dirs (fast). iCloud + ~/ are handled by watcher.
+                let scan_dirs = indexer::watcher::default_watch_dirs();
+                match startup_indexer.scan_dirs(&scan_dirs).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!("Startup scan complete: {} chunks indexed", count);
+                        } else {
+                            tracing::info!("Startup scan complete: all files already up to date");
+                        }
+                    }
+                    Err(e) => tracing::warn!("Startup scan failed: {}", e),
+                }
+
+                tray::set_status(&startup_handle, tray::TrayStatus::Idle);
+            });
+
             // Start background SONA learning tick
             let sona_ref = app.state::<Arc<AppState>>().sona.clone();
             let sona_persistence = app.state::<Arc<AppState>>().persistence.clone();
@@ -238,6 +361,42 @@ pub fn run() {
                             let _ = sona_persistence.store_blob("sona_patterns", &bytes);
                         }
                     }
+                }
+            });
+
+            // Background compression scan (every 24 hours, delayed 10 minutes after startup)
+            let compress_engine = app.state::<Arc<AppState>>().engine.clone();
+            let compress_compressor = app.state::<Arc<AppState>>().compressor.clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait 10 minutes before first scan
+                tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
+
+                loop {
+                    let nodes = compress_engine.memory.all_nodes();
+                    let mem_stats = compress_engine.memory.stats();
+                    let total_accesses = mem_stats.total_accesses as u64;
+
+                    let memories: Vec<crate::deepbrain::compress_bridge::MemoryForCompression> = nodes
+                        .iter()
+                        .map(|n| crate::deepbrain::compress_bridge::MemoryForCompression {
+                            id: n.id.clone(),
+                            access_count: n.access_count,
+                            vector_len: n.vector.len(),
+                        })
+                        .collect();
+
+                    let stats = compress_compressor.scan(&memories, total_accesses);
+                    tracing::info!(
+                        "Compression scan: {} memories ({} hot, {} warm, {} cold), est. savings {:.1}%",
+                        stats.total_memories,
+                        stats.hot_count,
+                        stats.warm_count,
+                        stats.cold_count,
+                        stats.estimated_savings_pct,
+                    );
+
+                    // Run every 24 hours
+                    tokio::time::sleep(tokio::time::Duration::from_secs(86400)).await;
                 }
             });
 
@@ -285,6 +444,7 @@ pub fn run() {
             commands::spotlight_search,
             commands::mail_search,
             commands::get_common_folders,
+            commands::list_folders,
             commands::pick_folder,
             commands::get_recent_emails,
             commands::search_emails,
@@ -302,6 +462,12 @@ pub fn run() {
             commands::get_nervous_stats,
             commands::verify_all,
             commands::bootstrap_sona,
+            commands::graph_stats,
+            commands::graph_neighbors,
+            commands::gnn_rerank,
+            commands::gnn_save_weights,
+            commands::compression_scan,
+            commands::compression_stats,
         ])
         .run(tauri::generate_context!())
         .expect("Error while running DeepBrain");

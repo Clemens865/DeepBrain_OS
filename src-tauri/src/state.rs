@@ -8,12 +8,16 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+use crate::activity::ActivityObserver;
 use crate::ai::AiProvider;
 use crate::brain::cognitive::CognitiveEngine;
 use crate::brain::embeddings::EmbeddingModel;
 use crate::brain::persistence::BrainPersistence;
 use crate::brain::types::CognitiveConfig;
 use crate::context::ContextManager;
+use crate::deepbrain::compress_bridge::CompressBridge;
+use crate::deepbrain::gnn_bridge::GnnBridge;
+use crate::deepbrain::graph_bridge::GraphBridge;
 use crate::deepbrain::llm_bridge::LlmBridge;
 use crate::deepbrain::nervous_bridge::NervousBridge;
 use crate::deepbrain::sona_bridge::SonaBridge;
@@ -39,6 +43,29 @@ pub struct AppSettings {
     /// Email accounts to index (empty = all accounts).
     #[serde(default)]
     pub email_accounts: Vec<String>,
+    /// Activity tracking: master toggle
+    #[serde(default = "default_true")]
+    pub activity_tracking_enabled: bool,
+    /// Activity tracking: apps to exclude from window title capture
+    #[serde(default)]
+    pub activity_excluded_apps: Vec<String>,
+    /// Activity tracking: capture browser tab titles (future use)
+    #[serde(default = "default_true")]
+    pub activity_track_browser: bool,
+    /// Activity tracking: capture terminal window titles
+    #[serde(default)]
+    pub activity_track_terminal: bool,
+    /// Activity tracking: days to retain events before pruning
+    #[serde(default = "default_30")]
+    pub activity_retention_days: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_30() -> u32 {
+    30
 }
 
 impl Default for AppSettings {
@@ -57,6 +84,11 @@ impl Default for AppSettings {
             api_port: None,
             api_token: None,
             email_accounts: vec![],
+            activity_tracking_enabled: true,
+            activity_excluded_apps: vec![],
+            activity_track_browser: true,
+            activity_track_terminal: false,
+            activity_retention_days: 30,
         }
     }
 }
@@ -88,7 +120,11 @@ pub struct AppState {
     pub sona: Arc<SonaBridge>,
     pub nervous: Arc<NervousBridge>,
     pub llm: Arc<LlmBridge>,
+    pub graph: Arc<GraphBridge>,
+    pub gnn: Arc<GnnBridge>,
+    pub compressor: Arc<CompressBridge>,
     pub vector_store: Arc<DeepBrainVectorStore>,
+    pub activity: Arc<ActivityObserver>,
     pub ai_provider: RwLock<Option<Box<dyn AiProvider>>>,
     pub settings: RwLock<AppSettings>,
     pub shutdown: Notify,
@@ -122,6 +158,39 @@ impl AppState {
 
         // Create local LLM bridge (ruvllm CandleBackend — model loaded on demand)
         let llm = Arc::new(LlmBridge::new());
+
+        // Create knowledge graph bridge (persistent)
+        let graph = Arc::new(
+            GraphBridge::open(&data_dir).unwrap_or_else(|e| {
+                tracing::warn!("Failed to open graph database, using in-memory: {}", e);
+                GraphBridge::in_memory()
+            }),
+        );
+        tracing::info!(
+            "Knowledge graph ready ({} nodes, {} edges)",
+            graph.stats().node_count,
+            graph.stats().edge_count,
+        );
+
+        // Create GNN reranker bridge (restore weights if persisted)
+        let gnn = Arc::new(match persistence.load_blob("gnn_weights") {
+            Ok(Some(bytes)) => {
+                match std::str::from_utf8(&bytes).ok().and_then(|json| GnnBridge::from_persisted(json).ok()) {
+                    Some(bridge) => {
+                        tracing::info!("Restored GNN reranker weights");
+                        bridge
+                    }
+                    None => {
+                        tracing::warn!("Failed to deserialize GNN weights, using fresh layer");
+                        GnnBridge::new()
+                    }
+                }
+            }
+            _ => GnnBridge::new(),
+        });
+
+        // Create tensor compression bridge
+        let compressor = Arc::new(CompressBridge::new());
 
         // Create cognitive engine with RVF-backed memory + SONA + nervous system
         let engine = CognitiveEngine::with_all(
@@ -185,6 +254,29 @@ impl AppState {
             tracing::info!("Loaded API token from Keychain");
         }
 
+        // Ensure we always have an API token in settings (generate if Keychain was empty)
+        if settings.api_token.is_none() {
+            let generated = uuid::Uuid::new_v4().to_string();
+            let _ = crate::keychain::store_secret("api_token", &generated);
+            // Also write token to data directory as a fallback (Keychain may be unavailable)
+            let token_file = data_dir.join(".api_token");
+            if let Err(e) = std::fs::write(&token_file, &generated) {
+                tracing::warn!("Failed to write API token file: {}", e);
+            } else {
+                // Restrict permissions to owner only (chmod 600)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600));
+                }
+                tracing::info!(
+                    "API token written to {:?} (and Keychain if available)",
+                    token_file,
+                );
+            }
+            settings.api_token = Some(generated);
+        }
+
         engine.set_running(true);
 
         let embeddings = Arc::new(embeddings);
@@ -213,6 +305,17 @@ impl AppState {
             tracing::info!("Email indexer limited to accounts: {:?}", settings.email_accounts);
         }
 
+        // Initialize activity observer
+        let activity = Arc::new(ActivityObserver::new(&data_dir)?);
+        // Apply activity settings from loaded AppSettings
+        activity.update_settings(crate::activity::ActivitySettings {
+            enabled: settings.activity_tracking_enabled,
+            excluded_apps: settings.activity_excluded_apps.clone(),
+            track_browser: settings.activity_track_browser,
+            track_terminal: settings.activity_track_terminal,
+            retention_days: settings.activity_retention_days,
+        });
+
         let ai_provider = Self::build_ai_provider(&settings);
 
         let persistence = Arc::new(persistence);
@@ -232,7 +335,11 @@ impl AppState {
             sona,
             nervous,
             llm,
+            graph,
+            gnn,
+            compressor,
             vector_store,
+            activity,
             ai_provider: RwLock::new(ai_provider),
             settings: RwLock::new(settings),
             shutdown: Notify::new(),
@@ -296,6 +403,16 @@ impl AppState {
             serde_json::to_string(&settings).map_err(|e| format!("Serialize error: {}", e))?;
         self.persistence
             .store_config("app_settings", &settings_json)?;
+
+        // Save GNN reranker weights
+        match self.gnn.to_json() {
+            Ok(json) => {
+                let _ = self.persistence.store_blob("gnn_weights", json.as_bytes());
+            }
+            Err(e) => {
+                tracing::warn!("Failed to serialize GNN weights: {}", e);
+            }
+        }
 
         // Save SONA learned patterns
         let patterns = self.sona.export_patterns();

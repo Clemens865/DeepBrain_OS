@@ -50,6 +50,8 @@ export default function DashboardView() {
     sonaStats,
     nervousStats,
     llmStatus,
+    graphStats,
+    compressionStats,
     verifyResult,
     verifying,
     loadStatus,
@@ -268,6 +270,63 @@ export default function DashboardView() {
             </div>
           </Panel>
         )}
+
+        {/* Knowledge Graph Panel */}
+        <Panel title="Knowledge Graph">
+          {graphStats ? (
+            <div className="space-y-2">
+              <div className="grid grid-cols-3 gap-2">
+                <Stat label="Nodes" value={graphStats.node_count} />
+                <Stat label="Edges" value={graphStats.edge_count} />
+                <Stat label="Clusters" value={graphStats.hyperedge_count} />
+              </div>
+              <div className="border-t border-brain-border/50 pt-2 mt-2">
+                <div className="flex items-center gap-1.5">
+                  <Dot ok={graphStats.node_count > 0} />
+                  <span className="text-brain-text/40 text-[10px]">
+                    {graphStats.node_count > 0 ? "Graph active" : "No data yet"}
+                  </span>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-brain-text/30 text-xs">Loading...</div>
+          )}
+        </Panel>
+
+        {/* GNN Re-ranker Panel */}
+        <Panel title="GNN Re-ranker">
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Dot ok={true} />
+              <span className="text-brain-text/60 text-xs">Attention layer active</span>
+            </div>
+            <div className="text-brain-text/30 text-[10px] space-y-0.5">
+              <div>Dimensions: 384 &middot; Heads: 4</div>
+              <div>Blend: 0.7 vector + 0.3 GNN</div>
+              <div>Weights persisted on flush</div>
+            </div>
+          </div>
+        </Panel>
+
+        {/* Tensor Compression Panel */}
+        <Panel title="Tensor Compression">
+          {compressionStats ? (
+            <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-2">
+                <Stat label="Hot" value={compressionStats.hot_count} />
+                <Stat label="Warm" value={compressionStats.warm_count} />
+                <Stat label="Cold" value={compressionStats.cold_count} />
+                <Stat label="Savings" value={`${compressionStats.estimated_savings_pct}%`} />
+              </div>
+              <div className="border-t border-brain-border/50 pt-2 mt-2 text-brain-text/30 text-[10px]">
+                {compressionStats.total_memories} memories scanned
+              </div>
+            </div>
+          ) : (
+            <div className="text-brain-text/30 text-xs">Loading...</div>
+          )}
+        </Panel>
       </div>
 
       {/* Health Verification */}

@@ -116,7 +116,7 @@ export default function ContentList() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [handleKeyDown]);
 
-  if (browseCategory === "home" || browseCategory === "status") {
+  if (browseCategory === "home" || browseCategory === "status" || browseCategory === "knowledge-graph") {
     return null; // These categories render their own full-view content in BrowseView
   }
 

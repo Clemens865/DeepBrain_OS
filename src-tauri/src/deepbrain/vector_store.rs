@@ -158,8 +158,8 @@ impl DeepBrainVectorStore {
             m: 16,
             ef_construction: 200,
             witness: WitnessConfig {
-                witness_ingest: true,
-                witness_delete: true,
+                witness_ingest: false,
+                witness_delete: false,
                 witness_compact: true,
                 audit_queries: false,
             },
@@ -208,26 +208,32 @@ impl DeepBrainVectorStore {
 
     /// Open an existing store or create a new one if it doesn't exist.
     ///
-    /// If the existing store is corrupt (e.g. missing manifest), it is renamed
-    /// to `.corrupt_<timestamp>` and a fresh store is created.
+    /// If the existing store is corrupt (e.g. missing manifest), it is deleted
+    /// and a fresh store is created.
     pub fn open_or_create(data_dir: &Path) -> Result<Self, DeepBrainError> {
         let rvtext_path = data_dir.join("knowledge.rvtext");
         if rvtext_path.exists() {
             match Self::open(data_dir) {
                 Ok(store) => Ok(store),
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to open existing RVF store, creating fresh: {}",
-                        e
-                    );
-                    // Rename corrupt files so we don't lose data
-                    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-                    let corrupt_name = format!("knowledge.rvtext.corrupt_{}", ts);
-                    let _ = std::fs::rename(&rvtext_path, data_dir.join(&corrupt_name));
+                    // Log size of corrupt file for diagnostics, then delete
+                    // (renaming a multi-GB corrupt file wastes disk space)
+                    if let Ok(meta) = std::fs::metadata(&rvtext_path) {
+                        let size_mb = meta.len() / (1024 * 1024);
+                        tracing::warn!(
+                            "Deleting corrupt RVF store ({} MB): {}",
+                            size_mb, e
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Failed to open existing RVF store, creating fresh: {}",
+                            e
+                        );
+                    }
+                    let _ = std::fs::remove_file(&rvtext_path);
                     let idmap_path = data_dir.join("deepbrain_ids.db");
                     if idmap_path.exists() {
-                        let idmap_corrupt = format!("deepbrain_ids.db.corrupt_{}", ts);
-                        let _ = std::fs::rename(&idmap_path, data_dir.join(&idmap_corrupt));
+                        let _ = std::fs::remove_file(&idmap_path);
                     }
                     Self::create(data_dir)
                 }
@@ -237,6 +243,26 @@ impl DeepBrainVectorStore {
         }
     }
 
+    /// Maximum allowed file size (2 GB). Writes are refused beyond this limit.
+    const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+    /// Check the .rvtext file size and refuse writes if it exceeds the limit.
+    fn check_file_size(&self) -> Result<(), DeepBrainError> {
+        if let Ok(meta) = std::fs::metadata(&self.data_path) {
+            if meta.len() > Self::MAX_FILE_SIZE {
+                return Err(DeepBrainError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "RVF store exceeds {} GB limit ({:.1} GB) — compact or delete old data",
+                        Self::MAX_FILE_SIZE / (1024 * 1024 * 1024),
+                        meta.len() as f64 / (1024.0 * 1024.0 * 1024.0),
+                    ),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Store a single vector with metadata.
     pub fn store_vector(
         &self,
@@ -244,6 +270,8 @@ impl DeepBrainVectorStore {
         vector: &[f32],
         metadata: VectorMetadata,
     ) -> Result<(), DeepBrainError> {
+        self.check_file_size()?;
+
         if vector.len() != self.dimension as usize {
             return Err(DeepBrainError::DimensionMismatch {
                 expected: self.dimension,
@@ -285,6 +313,8 @@ impl DeepBrainVectorStore {
         if entries.is_empty() {
             return Ok(0);
         }
+
+        self.check_file_size()?;
 
         // Allocate all numeric IDs first.
         let mut num_ids = Vec::with_capacity(entries.len());
@@ -340,7 +370,7 @@ impl DeepBrainVectorStore {
             ef_search: 100,
             filter: filter.map(|f| f.to_filter_expr()),
             timeout_ms: 0,
-            quality_preference: QualityPreference::Auto,
+            quality_preference: QualityPreference::AcceptDegraded,
             ..Default::default()
         };
 

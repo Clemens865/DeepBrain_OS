@@ -18,6 +18,7 @@ const CATEGORY_LABELS: Record<BrowseCategory, string> = {
   spotlight: "Spotlight",
   email: "Email",
   status: "Status",
+  "knowledge-graph": "Knowledge Graph",
 };
 
 const MEMORY_TYPES: BrowseCategory[] = [

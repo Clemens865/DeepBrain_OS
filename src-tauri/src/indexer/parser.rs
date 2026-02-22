@@ -6,9 +6,22 @@ use std::path::Path;
 
 /// Supported file extensions
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "md", "txt", "rs", "ts", "tsx", "js", "jsx", "py", "json", "toml", "yaml", "yml", "html",
-    "css", "sh", "bash", "zsh", "fish", "swift", "go", "java", "c", "cpp", "h", "hpp", "rb",
-    "lua", "sql", "xml", "csv", "log", "conf", "cfg", "ini", "env", "pdf", "emlx", "eml",
+    // Documentation & prose
+    "md", "txt", "rst", "adoc", "tex", "org", "rtf",
+    // Data & config
+    "json", "toml", "yaml", "yml", "csv", "xml", "conf", "cfg", "ini", "env",
+    // Code
+    "rs", "ts", "tsx", "js", "jsx", "py", "swift", "go", "java", "c", "cpp", "h", "hpp",
+    "rb", "lua", "sql", "sh", "bash", "zsh", "fish", "r", "scala", "kt", "dart", "vue",
+    "svelte", "tf", "hcl",
+    // Web
+    "html", "css",
+    // Notebooks & logs
+    "ipynb", "log",
+    // Rich documents
+    "pdf", "emlx", "eml",
+    // Spreadsheets
+    "xlsx", "xls", "ods",
 ];
 
 /// Check if a file extension is supported for indexing
@@ -33,6 +46,11 @@ pub fn parse_file(path: &Path) -> Result<String, String> {
         return parse_pdf(path);
     }
 
+    // Excel/ODS spreadsheets
+    if matches!(ext.as_str(), "xlsx" | "xls" | "ods") {
+        return parse_spreadsheet(path);
+    }
+
     // Apple Mail .emlx format
     if ext == "emlx" {
         return parse_emlx(path);
@@ -53,6 +71,57 @@ pub fn parse_file(path: &Path) -> Result<String, String> {
         "html" | "xml" => parse_markup(&content),
         _ => Ok(clean_text(&content)),
     }
+}
+
+/// Parse an Excel/ODS spreadsheet and extract cell text
+fn parse_spreadsheet(path: &Path) -> Result<String, String> {
+    use calamine::{open_workbook_auto, Data, Reader};
+
+    let mut workbook = open_workbook_auto(path)
+        .map_err(|e| format!("Failed to open spreadsheet {:?}: {}", path, e))?;
+
+    let mut result = String::new();
+    let sheet_names: Vec<String> = workbook.sheet_names().to_vec();
+
+    for name in &sheet_names {
+        if let Ok(range) = workbook.worksheet_range(name) {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(&format!("## {}\n", name));
+
+            for row in range.rows() {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|cell| match cell {
+                        Data::String(s) => s.clone(),
+                        Data::Float(f) => format!("{}", f),
+                        Data::Int(i) => format!("{}", i),
+                        Data::Bool(b) => format!("{}", b),
+                        Data::DateTime(dt) => format!("{}", dt),
+                        Data::DateTimeIso(s) => s.clone(),
+                        Data::DurationIso(s) => s.clone(),
+                        Data::Error(e) => format!("{:?}", e),
+                        Data::Empty => String::new(),
+                    })
+                    .collect();
+
+                // Skip rows where all cells are empty
+                if cells.iter().all(|c| c.is_empty()) {
+                    continue;
+                }
+
+                result.push_str(&cells.join(" | "));
+                result.push('\n');
+            }
+        }
+    }
+
+    if result.trim().is_empty() {
+        return Err("Empty spreadsheet".to_string());
+    }
+
+    Ok(clean_text(&result))
 }
 
 /// Parse a PDF file and extract text

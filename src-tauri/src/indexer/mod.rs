@@ -27,6 +27,17 @@ pub struct FileResult {
     pub chunk: String,
     pub similarity: f64,
     pub file_type: String,
+    // Enhanced fields — only populated when include_preview=true
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_lines: Option<Vec<String>>,
 }
 
 /// File index entry stored in SQLite
@@ -148,8 +159,15 @@ impl FileIndexer {
         }
     }
 
-    /// Index a single file
-    pub async fn index_file(&self, path: &Path) -> Result<u32, String> {
+    /// Index a single file: parse, embed, store in SQLite.
+    ///
+    /// Returns the file chunks and their RVF batch entries for deferred RVF write.
+    /// The caller is responsible for flushing the RVF batch entries periodically
+    /// to avoid O(n²) manifest growth from too many small epochs.
+    async fn index_file_inner(
+        &self,
+        path: &Path,
+    ) -> Result<(u32, Vec<(String, Vec<f32>, VectorMetadata)>), String> {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -157,24 +175,8 @@ impl FileIndexer {
             .to_lowercase();
 
         if !parser::is_supported(&ext) {
-            return Ok(0);
+            return Ok((0, vec![]));
         }
-
-        let content = parser::parse_file(path)?;
-        if content.trim().is_empty() {
-            return Ok(0);
-        }
-
-        let chunks = chunker::chunk_text(&content, 512, 128);
-        if chunks.is_empty() {
-            return Ok(0);
-        }
-
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
 
         let modified = path
             .metadata()
@@ -189,6 +191,44 @@ impl FileIndexer {
 
         let path_str = path.to_string_lossy().to_string();
 
+        // Skip re-indexing if the file hasn't changed since last index.
+        // The modification time is already stored in SQLite — just compare it.
+        {
+            let conn = self.open_connection()?;
+            let stored_mtime: Option<i64> = conn
+                .query_row(
+                    "SELECT modified FROM file_index WHERE path = ?1",
+                    params![path_str],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            if stored_mtime == Some(modified) {
+                return Ok((0, vec![]));
+            }
+        }
+
+        let content = parser::parse_file(path)?;
+        if content.trim().is_empty() {
+            return Ok((0, vec![]));
+        }
+
+        // Prepend file path to content so the location becomes part of the
+        // semantic knowledge. This lets searches like "files in Context-Capture"
+        // or "documents on Desktop" return relevant results.
+        let content_with_path = format!("[{}]\n{}", path_str, content);
+
+        let chunks = chunker::chunk_text(&content_with_path, 512, 128);
+        if chunks.is_empty() {
+            return Ok((0, vec![]));
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
         // Embed all chunks
         let mut file_chunks = Vec::with_capacity(chunks.len());
         for (i, chunk) in chunks.iter().enumerate() {
@@ -201,7 +241,7 @@ impl FileIndexer {
             });
         }
 
-        // Store in database
+        // Store in SQLite database
         let conn = self.open_connection()?;
 
         // Upsert file entry
@@ -218,7 +258,7 @@ impl FileIndexer {
         )
         .map_err(|e| format!("Delete chunks failed: {}", e))?;
 
-        // Insert new chunks (SQLite + RVF vector store)
+        // Insert new chunks into SQLite
         for chunk in &file_chunks {
             let vector_bytes = vector_to_bytes(&chunk.vector);
             conn.execute(
@@ -226,9 +266,12 @@ impl FileIndexer {
                 params![chunk.file_path, chunk.chunk_index, chunk.content, vector_bytes],
             )
             .map_err(|e| format!("Store chunk failed: {}", e))?;
+        }
 
-            // Also insert into RVF vector store for indexed search.
-            if let Some(ref store) = self.vector_store {
+        // Build RVF batch entries (deferred — caller flushes them)
+        let rvf_batch: Vec<(String, Vec<f32>, VectorMetadata)> = file_chunks
+            .iter()
+            .map(|chunk| {
                 let chunk_id = format!("file::{}::{}", chunk.file_path, chunk.chunk_index);
                 let meta = VectorMetadata {
                     source: "file".to_string(),
@@ -236,17 +279,81 @@ impl FileIndexer {
                     timestamp: modified,
                     ..Default::default()
                 };
-                if let Err(e) = store.store_vector(&chunk_id, &chunk.vector, meta) {
-                    tracing::warn!("Failed to store file chunk in RVF: {}", e);
+                (chunk_id, chunk.vector.clone(), meta)
+            })
+            .collect();
+
+        Ok((file_chunks.len() as u32, rvf_batch))
+    }
+
+    /// Maximum RVF store size for file indexing (500 MB).
+    /// Beyond this, only re-indexing of already-indexed files is allowed
+    /// (updates existing vectors), but new files are rejected to cap growth.
+    const MAX_STORE_SIZE: u64 = 500 * 1024 * 1024;
+
+    /// Index a single file (public API — for individual file updates via watcher).
+    ///
+    /// Immediately flushes to RVF. For bulk scans, use `scan_all` which
+    /// accumulates vectors across files for efficient batch writes.
+    pub async fn index_file(&self, path: &Path) -> Result<u32, String> {
+        // Apply the same filtering as the watcher (for callers that bypass it)
+        if !watcher::should_index(path) {
+            return Ok(0);
+        }
+
+        // Storage budget: skip new files if RVF store exceeds limit.
+        // Allow re-indexing of existing files (just updates vectors in place).
+        if let Some(ref store) = self.vector_store {
+            let metrics = store.metrics();
+            if metrics.file_size_bytes > Self::MAX_STORE_SIZE {
+                // Check if this file is already indexed (update = ok, new = reject)
+                let path_str = path.to_string_lossy().to_string();
+                let conn = self.open_connection()?;
+                let exists: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM file_index WHERE path = ?1",
+                        params![path_str],
+                        |_| Ok(()),
+                    )
+                    .is_ok();
+                if !exists {
+                    return Ok(0); // Silently skip — budget exhausted
                 }
             }
         }
 
-        Ok(file_chunks.len() as u32)
+        let (count, rvf_batch) = self.index_file_inner(path).await?;
+        if !rvf_batch.is_empty() {
+            if let Some(ref store) = self.vector_store {
+                if let Err(e) = store.store_batch(&rvf_batch) {
+                    tracing::warn!("Failed to store file chunks in RVF: {}", e);
+                }
+            }
+        }
+        Ok(count)
     }
 
-    /// Scan and index all files in watched directories (recursive)
+    /// Scan specific directories (not all watched dirs).
+    /// Useful for startup scan that should only cover fast local dirs.
+    pub async fn scan_dirs(&self, dirs: &[PathBuf]) -> Result<u32, String> {
+        self.scan_impl(dirs).await
+    }
+
+    /// Scan and index all files in watched directories (recursive).
+    ///
+    /// Accumulates RVF vectors across files and flushes every `RVF_FLUSH_INTERVAL`
+    /// files to minimise the number of epochs (each epoch writes a full manifest,
+    /// so fewer epochs = dramatically smaller file).
     pub async fn scan_all(&self) -> Result<u32, String> {
+        let dirs: Vec<PathBuf> = self.watched_dirs.read().clone();
+        self.scan_impl(&dirs).await
+    }
+
+    /// Internal scan implementation shared by scan_all and scan_dirs.
+    async fn scan_impl(&self, dirs: &[PathBuf]) -> Result<u32, String> {
+        /// Flush RVF batch every N files to keep epoch count low.
+        const RVF_FLUSH_INTERVAL: usize = 500;
+
         {
             let is_indexing = self.is_indexing.read();
             if *is_indexing {
@@ -255,21 +362,86 @@ impl FileIndexer {
         }
         *self.is_indexing.write() = true;
 
-        let dirs: Vec<PathBuf> = self.watched_dirs.read().clone();
         let mut total = 0u32;
 
         // Collect all files recursively first
         let mut files = Vec::new();
-        for dir in &dirs {
+        for dir in dirs {
             collect_files_recursive(dir, &mut files, 10);
         }
 
-        tracing::info!("Found {} files to index", files.len());
+        // Apply the same filtering as the watcher
+        let before_filter = files.len();
+        files.retain(|p| watcher::should_index(p));
+        tracing::info!(
+            "Found {} files to index ({} filtered out)",
+            files.len(),
+            before_filter - files.len()
+        );
 
-        for path in &files {
-            match self.index_file(path).await {
-                Ok(chunks) => total += chunks,
+        // Accumulate RVF batch entries across files
+        let mut rvf_pending: Vec<(String, Vec<f32>, VectorMetadata)> = Vec::new();
+        let mut files_since_flush = 0usize;
+        let mut budget_exhausted = false;
+
+        for (i, path) in files.iter().enumerate() {
+            // Check storage budget periodically (every 100 files to avoid overhead)
+            if !budget_exhausted && i % 100 == 0 {
+                if let Some(ref store) = self.vector_store {
+                    if store.metrics().file_size_bytes > Self::MAX_STORE_SIZE {
+                        tracing::warn!(
+                            "Storage budget reached ({} MB) — stopping scan at file {}/{}",
+                            Self::MAX_STORE_SIZE / (1024 * 1024), i, files.len()
+                        );
+                        budget_exhausted = true;
+                    }
+                }
+            }
+            if budget_exhausted {
+                break;
+            }
+
+            match self.index_file_inner(path).await {
+                Ok((chunks, rvf_batch)) => {
+                    total += chunks;
+                    rvf_pending.extend(rvf_batch);
+                    files_since_flush += 1;
+                }
                 Err(e) => tracing::debug!("Skipped {:?}: {}", path, e),
+            }
+
+            // Flush accumulated vectors to RVF every N files
+            if files_since_flush >= RVF_FLUSH_INTERVAL && !rvf_pending.is_empty() {
+                if let Some(ref store) = self.vector_store {
+                    let batch_len = rvf_pending.len();
+                    if let Err(e) = store.store_batch(&rvf_pending) {
+                        tracing::warn!("Failed to flush RVF batch: {}", e);
+                    } else {
+                        tracing::info!(
+                            "RVF flush: {} vectors from {} files (progress: {}/{})",
+                            batch_len, files_since_flush, i + 1, files.len()
+                        );
+                    }
+                }
+                rvf_pending.clear();
+                files_since_flush = 0;
+            }
+
+            // Yield to the async runtime every 10 files
+            if i % 10 == 9 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // Final flush of remaining vectors
+        if !rvf_pending.is_empty() {
+            if let Some(ref store) = self.vector_store {
+                let batch_len = rvf_pending.len();
+                if let Err(e) = store.store_batch(&rvf_pending) {
+                    tracing::warn!("Failed to flush final RVF batch: {}", e);
+                } else {
+                    tracing::info!("RVF final flush: {} vectors from {} files", batch_len, files_since_flush);
+                }
             }
         }
 
@@ -285,7 +457,11 @@ impl FileIndexer {
 
         // Try RVF vector store first (fast O(log n))
         if let Some(ref store) = self.vector_store {
-            return self.search_rvf(store, &query_vector, limit);
+            let results = self.search_rvf(store, &query_vector, limit)?;
+            if !results.is_empty() {
+                return Ok(results);
+            }
+            // RVF returned nothing — fall through to brute-force.
         }
 
         // Fallback: brute-force scan of all chunks
@@ -301,11 +477,24 @@ impl FileIndexer {
     ) -> Result<Vec<FileResult>, String> {
         // Over-fetch to allow for type boosting to reorder results.
         let fetch_k = (limit as usize) * 3;
-        let filter = Some(VectorFilter::Source("file".to_string()));
 
-        let rvf_results = store
-            .search(query_vector, fetch_k, filter)
-            .map_err(|e| format!("RVF search failed: {}", e))?;
+        // Try metadata-filtered search first; fall back to unfiltered + ID-prefix
+        // filtering if metadata filters aren't supported (degraded/flat mode).
+        let rvf_results = {
+            let filtered = store
+                .search(query_vector, fetch_k, Some(VectorFilter::Source("file".to_string())))
+                .map_err(|e| format!("RVF search failed: {}", e))?;
+            if filtered.is_empty() {
+                store
+                    .search(query_vector, fetch_k * 10, None)
+                    .map_err(|e| format!("RVF search (unfiltered) failed: {}", e))?
+                    .into_iter()
+                    .filter(|r| r.id.starts_with("file::"))
+                    .collect()
+            } else {
+                filtered
+            }
+        };
 
         let conn = self.open_connection()?;
 
@@ -351,6 +540,11 @@ impl FileIndexer {
                     chunk: content,
                     similarity: vr.similarity,
                     file_type: ext,
+                    file_size_bytes: None,
+                    modified: None,
+                    project: None,
+                    line_count: None,
+                    preview_lines: None,
                 });
             }
         }
@@ -358,7 +552,7 @@ impl FileIndexer {
         // Apply file-type boost.
         for result in &mut results {
             match result.file_type.as_str() {
-                "md" | "txt" | "pdf" | "rtf" | "docx" | "doc" => {
+                "md" | "txt" | "pdf" | "rtf" | "docx" | "doc" | "xlsx" | "xls" | "csv" | "ods" => {
                     result.similarity *= 1.15;
                 }
                 "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "cpp"
@@ -411,6 +605,11 @@ impl FileIndexer {
                     chunk: content,
                     similarity,
                     file_type: ext,
+                    file_size_bytes: None,
+                    modified: None,
+                    project: None,
+                    line_count: None,
+                    preview_lines: None,
                 })
             })
             .map_err(|e| format!("Search failed: {}", e))?
@@ -421,7 +620,7 @@ impl FileIndexer {
         // Boost documentation files by 15%, slight penalty for code files
         for result in &mut results {
             match result.file_type.as_str() {
-                "md" | "txt" | "pdf" | "rtf" | "docx" | "doc" => {
+                "md" | "txt" | "pdf" | "rtf" | "docx" | "doc" | "xlsx" | "xls" | "csv" | "ods" => {
                     result.similarity *= 1.15;
                 }
                 "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "cpp"
@@ -527,6 +726,56 @@ impl FileIndexer {
         Ok(rows)
     }
 
+    /// Detect projects from indexed file paths.
+    ///
+    /// Groups all files in `file_index` by their detected project root and
+    /// returns aggregate counts. Computes at query time (no schema change).
+    pub fn projects(&self) -> Result<Vec<crate::activity::ProjectInfo>, String> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn
+            .prepare("SELECT path, chunk_count FROM file_index WHERE path NOT LIKE 'mail://%'")
+            .map_err(|e| format!("projects query failed: {}", e))?;
+
+        let rows: Vec<(String, u32)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(|e| format!("projects scan failed: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Group by detected project
+        let mut project_map: std::collections::HashMap<String, (Option<String>, u32, u32)> =
+            std::collections::HashMap::new();
+
+        for (path, chunk_count) in &rows {
+            if let Some(project_name) = crate::activity::detect_project_from_path(path) {
+                let entry = project_map
+                    .entry(project_name)
+                    .or_insert((None, 0, 0));
+                // Try to extract the project root path (walk up to marker)
+                if entry.0.is_none() {
+                    entry.0 = detect_project_root(path);
+                }
+                entry.1 += 1; // file count
+                entry.2 += chunk_count; // chunk count
+            }
+        }
+
+        let results = project_map
+            .into_iter()
+            .map(|(name, (path, files, chunks))| crate::activity::ProjectInfo {
+                name,
+                path,
+                last_active: None,
+                indexed_files: files,
+                indexed_chunks: chunks,
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     /// Get index statistics
     pub fn stats(&self) -> Result<IndexStats, String> {
         let conn = self.open_connection()?;
@@ -548,6 +797,84 @@ impl FileIndexer {
             is_indexing,
         })
     }
+}
+
+/// Enrich a `FileResult` with filesystem metadata (size, modified, preview, project).
+///
+/// Called by the API handler when `include_preview=true`. Keeps the core
+/// search path fast by only doing I/O when explicitly requested.
+pub fn enrich_result(result: &mut FileResult) {
+    let path = std::path::Path::new(&result.path);
+
+    // file_size_bytes + modified from filesystem metadata
+    if let Ok(meta) = std::fs::metadata(path) {
+        result.file_size_bytes = Some(meta.len());
+        if let Ok(modified) = meta.modified() {
+            let dt: chrono::DateTime<chrono::Utc> = modified.into();
+            result.modified = Some(dt.to_rfc3339());
+        }
+    }
+
+    // project detection
+    result.project = crate::activity::detect_project_from_path(&result.path);
+
+    // preview_lines + line_count (only for files < 1 MB)
+    let size = result.file_size_bytes.unwrap_or(0);
+    if size > 0 && size < 1_048_576 {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let lines: Vec<&str> = content.lines().collect();
+            result.line_count = Some(lines.len() as u32);
+            result.preview_lines = Some(
+                lines
+                    .iter()
+                    .take(5)
+                    .map(|l| l.to_string())
+                    .collect(),
+            );
+        }
+    }
+}
+
+/// Walk up from a file path to find the project root directory path.
+fn detect_project_root(path_str: &str) -> Option<String> {
+    let expanded = if path_str.starts_with('~') {
+        dirs::home_dir()
+            .map(|h| path_str.replacen('~', &h.to_string_lossy(), 1))
+            .unwrap_or_else(|| path_str.to_string())
+    } else {
+        path_str.to_string()
+    };
+
+    let path = std::path::Path::new(&expanded);
+    let markers = [
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        ".xcodeproj",
+        "go.mod",
+    ];
+
+    let mut current = if path.is_file() {
+        path.parent().map(|p| p.to_path_buf())
+    } else {
+        Some(path.to_path_buf())
+    };
+
+    while let Some(dir) = current {
+        for marker in &markers {
+            if dir.join(marker).exists() {
+                return Some(dir.to_string_lossy().to_string());
+            }
+        }
+        current = dir.parent().map(|p| p.to_path_buf());
+        if let Some(home) = dirs::home_dir() {
+            if current.as_deref() == Some(home.as_path()) {
+                break;
+            }
+        }
+    }
+    None
 }
 
 /// File list item for browsing
@@ -591,20 +918,21 @@ fn bytes_to_vector(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Directories to skip during recursive scanning
+/// Directories to skip during recursive scanning.
+/// Keep in sync with watcher::SKIP_DIRS.
 const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    ".git",
-    ".svn",
-    ".hg",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".cache",
-    "build",
-    "dist",
-    ".Trash",
+    // VCS
+    ".git", ".svn", ".hg",
+    // Build / dependency
+    "node_modules", "target", "build", "dist", "__pycache__",
+    ".venv", "venv", ".cache", "Pods", ".next", ".nuxt",
+    "vendor", "bower_components",
+    // Package managers
+    ".npm", ".cargo", ".rustup",
+    // System (macOS)
+    ".Trash", "Library",
+    // Media (not useful for knowledge layer)
+    "Movies", "Music", "Pictures", "Photos Library.photoslibrary",
 ];
 
 /// Recursively collect files, skipping hidden/undesirable directories

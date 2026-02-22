@@ -34,7 +34,7 @@ struct OnnxSession {
 /// Embedding model manager
 pub struct EmbeddingModel {
     provider: RwLock<EmbeddingProvider>,
-    onnx_session: parking_lot::Mutex<Option<OnnxSession>>,
+    onnx_session: std::sync::Arc<parking_lot::Mutex<Option<OnnxSession>>>,
     ollama_url: String,
     ollama_model: String,
     model_dir: PathBuf,
@@ -50,7 +50,7 @@ impl EmbeddingModel {
 
         Self {
             provider: RwLock::new(EmbeddingProvider::Hash),
-            onnx_session: parking_lot::Mutex::new(None),
+            onnx_session: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             ollama_url: "http://127.0.0.1:11434".to_string(),
             ollama_model: "nomic-embed-text".to_string(),
             model_dir,
@@ -200,7 +200,17 @@ impl EmbeddingModel {
         let provider = self.provider.read().clone();
         match provider {
             EmbeddingProvider::Ollama => self.embed_ollama(text).await,
-            EmbeddingProvider::Onnx => self.embed_onnx(text),
+            EmbeddingProvider::Onnx => {
+                // Run ONNX inference on a blocking thread so the async runtime
+                // stays responsive for API handlers during long indexing runs.
+                let session = std::sync::Arc::clone(&self.onnx_session);
+                let text = text.to_string();
+                tokio::task::spawn_blocking(move || {
+                    Self::embed_onnx_static(&session, &text)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking join error: {}", e))?
+            }
             EmbeddingProvider::Hash => Ok(self.embed_hash(text)),
         }
     }
@@ -269,9 +279,15 @@ impl EmbeddingModel {
         Ok(result)
     }
 
-    /// ONNX embedding using all-MiniLM-L6-v2
-    fn embed_onnx(&self, text: &str) -> Result<Vec<f32>, String> {
-        let mut session_guard = self.onnx_session.lock();
+    /// ONNX embedding using all-MiniLM-L6-v2.
+    ///
+    /// Static version that takes the session Arc directly so it can be
+    /// called from `spawn_blocking` without requiring `&self`.
+    fn embed_onnx_static(
+        onnx_session: &std::sync::Arc<parking_lot::Mutex<Option<OnnxSession>>>,
+        text: &str,
+    ) -> Result<Vec<f32>, String> {
+        let mut session_guard = onnx_session.lock();
         let session = session_guard.as_mut()
             .ok_or("ONNX session not loaded")?;
 

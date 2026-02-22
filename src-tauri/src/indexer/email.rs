@@ -32,6 +32,7 @@ pub struct IndexedEmail {
     pub body: String,
     pub account: String,
     pub mailbox: String,
+    pub has_attachments: bool,
 }
 
 /// Statistics about the email index
@@ -140,11 +141,18 @@ impl EmailIndexer {
                 account TEXT NOT NULL,
                 mailbox TEXT NOT NULL,
                 indexed_at INTEGER NOT NULL,
-                chunk_count INTEGER NOT NULL DEFAULT 0
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                has_attachments INTEGER
             );
             ",
         )
         .map_err(|e| format!("Email DB init failed: {}", e))?;
+
+        // Additive migration: add has_attachments column if missing (existing DBs)
+        let _ = conn.execute_batch(
+            "ALTER TABLE email_index ADD COLUMN has_attachments INTEGER;",
+        );
+
         Ok(())
     }
 
@@ -188,42 +196,50 @@ impl EmailIndexer {
             "end if".to_string()
         };
 
-        // AppleScript: iterate accounts → mailboxes, get read messages
-        // We fetch full body (up to 2000 chars) for indexing
+        // AppleScript: iterate accounts → inbox mailbox of each account, get read messages.
+        // Only scans inbox-like mailboxes (INBOX, Posteingang) for performance —
+        // scanning all mailboxes takes 3+ minutes due to Mail.app's AppleScript overhead.
         let script = format!(
             r#"tell application "Mail"
   set output to ""
   set resultCount to 0
   set maxResults to {batch_size}
+  set inboxNames to {{"INBOX", "Posteingang", "Inbox"}}
   {account_filter}
   repeat with acct in accounts
     set acctName to name of acct
     {account_check}
     repeat with mbox in mailboxes of acct
       set mboxName to name of mbox
-      try
-        set msgs to (messages of mbox whose read status is true and date received > (current date) - 30 * days)
-        set msgCount to count of msgs
-        if msgCount > 0 then
-          set endIdx to msgCount
-          if endIdx > 20 then set endIdx to 20
-          repeat with i from 1 to endIdx
-            if resultCount >= maxResults then exit repeat
-            set m to item i of msgs
-            set subj to subject of m
-            set sndr to sender of m
-            set dt to (date received of m) as string
-            set msgId to (id of m) as string
-            set bodyText to ""
-            try
-              set bodyText to (content of m)
-              if (length of bodyText) > 2000 then set bodyText to (text 1 through 2000 of bodyText)
-            end try
-            set output to output & msgId & "␞" & subj & "␞" & sndr & "␞" & dt & "␞" & bodyText & "␞" & acctName & "␞" & mboxName & "␟"
-            set resultCount to resultCount + 1
-          end repeat
-        end if
-      end try
+      if inboxNames contains mboxName then
+        try
+          set msgs to (messages of mbox whose read status is true and date received > (current date) - 30 * days)
+          set msgCount to count of msgs
+          if msgCount > 0 then
+            set endIdx to msgCount
+            if endIdx > maxResults then set endIdx to maxResults
+            repeat with i from 1 to endIdx
+              if resultCount >= maxResults then exit repeat
+              set m to item i of msgs
+              set subj to subject of m
+              set sndr to sender of m
+              set dt to (date received of m) as string
+              set msgId to (id of m) as string
+              set bodyText to ""
+              try
+                set bodyText to (content of m)
+                if (length of bodyText) > 2000 then set bodyText to (text 1 through 2000 of bodyText)
+              end try
+              set hasAttach to "0"
+              try
+                if (count of mail attachments of m) > 0 then set hasAttach to "1"
+              end try
+              set output to output & msgId & "␞" & subj & "␞" & sndr & "␞" & dt & "␞" & bodyText & "␞" & acctName & "␞" & mboxName & "␞" & hasAttach & "␟"
+              set resultCount to resultCount + 1
+            end repeat
+          end if
+        end try
+      end if
       if resultCount >= maxResults then exit repeat
     end repeat
     if resultCount >= maxResults then exit repeat
@@ -237,9 +253,10 @@ end tell"#,
             account_check_end = account_check_end,
         );
 
-        // Run with a timeout to prevent hangs
+        // Run with a timeout to prevent hangs.
+        // 120s allows for large mailboxes (Mail.app can be slow on first access).
         let result = tokio::time::timeout(
-            Duration::from_secs(60),
+            Duration::from_secs(120),
             tokio::process::Command::new("osascript")
                 .arg("-e")
                 .arg(&script)
@@ -250,7 +267,7 @@ end tell"#,
         let output = match result {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => return Err(format!("osascript failed: {}", e)),
-            Err(_) => return Err("Email fetch timed out after 60s".to_string()),
+            Err(_) => return Err("Email fetch timed out after 120s".to_string()),
         };
 
         if !output.status.success() {
@@ -265,6 +282,10 @@ end tell"#,
             .filter_map(|record| {
                 let fields: Vec<&str> = record.split('␞').collect();
                 if fields.len() >= 7 {
+                    let has_attachments = fields
+                        .get(7)
+                        .map(|v| v.trim() == "1")
+                        .unwrap_or(false);
                     Some(IndexedEmail {
                         message_id: fields[0].trim().parse().unwrap_or(0),
                         subject: fields[1].trim().to_string(),
@@ -273,6 +294,7 @@ end tell"#,
                         body: fields[4].trim().replace('\r', ""),
                         account: fields[5].trim().to_string(),
                         mailbox: fields[6].trim().to_string(),
+                        has_attachments,
                     })
                 } else {
                     None
@@ -378,6 +400,12 @@ end tell"#,
         tracing::info!("Fetched {} emails from Mail.app", emails.len());
 
         let mut indexed = 0u32;
+        let mut rvf_pending: Vec<(String, Vec<f32>, VectorMetadata)> = Vec::new();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
 
         for email in &emails {
             // Skip if already indexed
@@ -433,7 +461,10 @@ end tell"#,
                 continue;
             }
 
-            // Store in database
+            // Build RVF batch entries (deferred until end of pass)
+            rvf_pending.extend(Self::build_rvf_batch(&synthetic_path, &chunk_vectors, now));
+
+            // Store in SQLite database
             if let Err(e) = self.store_email(email, &synthetic_path, &display_name, &chunk_vectors) {
                 tracing::warn!("Failed to store email {}: {}", email.message_id, e);
                 continue;
@@ -441,6 +472,18 @@ end tell"#,
 
             indexed += 1;
             tracing::debug!("Indexed email: {} ({} chunks)", email.subject, chunk_vectors.len());
+        }
+
+        // Flush all accumulated RVF vectors in a single batch (one epoch per pass)
+        if !rvf_pending.is_empty() {
+            if let Some(ref store) = self.vector_store {
+                let batch_len = rvf_pending.len();
+                if let Err(e) = store.store_batch(&rvf_pending) {
+                    tracing::warn!("Failed to flush email RVF batch: {}", e);
+                } else {
+                    tracing::info!("Email RVF flush: {} vectors from {} emails", batch_len, indexed);
+                }
+            }
         }
 
         if indexed > 0 {
@@ -467,8 +510,8 @@ end tell"#,
 
         // Record in email_index
         conn.execute(
-            "INSERT OR REPLACE INTO email_index (message_id, subject, sender, date_received, account, mailbox, indexed_at, chunk_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO email_index (message_id, subject, sender, date_received, account, mailbox, indexed_at, chunk_count, has_attachments)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 email.message_id,
                 email.subject,
@@ -478,6 +521,7 @@ end tell"#,
                 email.mailbox,
                 now,
                 chunks.len() as u32,
+                email.has_attachments,
             ],
         )
         .map_err(|e| format!("Store email index failed: {}", e))?;
@@ -498,7 +542,7 @@ end tell"#,
         )
         .map_err(|e| format!("Delete old email chunks failed: {}", e))?;
 
-        // Insert new chunks (SQLite + RVF vector store)
+        // Insert new chunks into SQLite
         for (i, (content, vector)) in chunks.iter().enumerate() {
             let vector_bytes = vector_to_bytes(vector);
             conn.execute(
@@ -507,23 +551,35 @@ end tell"#,
                 params![synthetic_path, i as u32, content, vector_bytes],
             )
             .map_err(|e| format!("Store email chunk failed: {}", e))?;
+        }
 
-            // Also insert into RVF vector store for indexed search.
-            if let Some(ref store) = self.vector_store {
+        // Build RVF batch entries (deferred — caller accumulates and flushes).
+        // This is NOT flushed here to avoid creating one epoch per email.
+        // The index_pass_inner method flushes once at the end.
+
+        Ok(())
+    }
+
+    /// Build RVF batch entries for a stored email's chunks.
+    fn build_rvf_batch(
+        synthetic_path: &str,
+        chunks: &[(String, Vec<f32>)],
+        timestamp: i64,
+    ) -> Vec<(String, Vec<f32>, VectorMetadata)> {
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(i, (_content, vector))| {
                 let chunk_id = format!("email::{}::{}", synthetic_path, i);
                 let meta = VectorMetadata {
                     source: "email".to_string(),
                     path: synthetic_path.to_string(),
-                    timestamp: now,
+                    timestamp,
                     ..Default::default()
                 };
-                if let Err(e) = store.store_vector(&chunk_id, vector, meta) {
-                    tracing::warn!("Failed to store email chunk in RVF: {}", e);
-                }
-            }
-        }
-
-        Ok(())
+                (chunk_id, vector.clone(), meta)
+            })
+            .collect()
     }
 
     /// Search indexed emails by semantic similarity.
@@ -531,12 +587,17 @@ end tell"#,
     pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<EmailSearchResult>, String> {
         let query_vector = self.embeddings.embed(query).await?;
 
-        // Try RVF vector store first (fast O(log n) — major perf upgrade from brute-force).
+        // Try RVF vector store first (fast O(log n)).
         if let Some(ref store) = self.vector_store {
-            return self.search_rvf(store, &query_vector, limit);
+            let results = self.search_rvf(store, &query_vector, limit)?;
+            if !results.is_empty() {
+                return Ok(results);
+            }
+            // RVF returned nothing — fall through to brute-force (emails may
+            // not have been flushed to RVF yet).
         }
 
-        // Fallback: brute-force SQL scan (original implementation).
+        // Fallback: brute-force SQL scan.
         self.search_brute_force(&query_vector, limit)
     }
 
@@ -548,11 +609,26 @@ end tell"#,
         limit: u32,
     ) -> Result<Vec<EmailSearchResult>, String> {
         let fetch_k = (limit as usize) * 3;
-        let filter = Some(VectorFilter::Source("email".to_string()));
 
-        let rvf_results = store
-            .search(query_vector, fetch_k, filter)
-            .map_err(|e| format!("RVF email search failed: {}", e))?;
+        // Try metadata-filtered search first; fall back to unfiltered + ID-prefix
+        // filtering if metadata filters aren't supported (degraded/flat mode).
+        let rvf_results = {
+            let filtered = store
+                .search(query_vector, fetch_k, Some(VectorFilter::Source("email".to_string())))
+                .map_err(|e| format!("RVF email search failed: {}", e))?;
+            if filtered.is_empty() {
+                // Metadata filter may not work in degraded mode — fetch more and
+                // filter by ID prefix client-side.
+                store
+                    .search(query_vector, fetch_k * 10, None)
+                    .map_err(|e| format!("RVF email search (unfiltered) failed: {}", e))?
+                    .into_iter()
+                    .filter(|r| r.id.starts_with("email::"))
+                    .collect()
+            } else {
+                filtered
+            }
+        };
 
         let conn = self.open_connection()?;
 
@@ -592,6 +668,34 @@ end tell"#,
             );
 
             if let Ok((subject, sender, date, mailbox, chunk)) = row_result {
+                let sender_name = parse_sender_name(&sender);
+
+                // Fetch preview from first chunk (chunk_index=0)
+                let preview: Option<String> = conn
+                    .query_row(
+                        "SELECT content FROM file_chunks WHERE file_path = ?1 AND chunk_index = 0",
+                        params![synthetic_path],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                    .map(|c| {
+                        let clean = c.replace('\n', " ").replace('\r', "");
+                        if clean.len() > 200 {
+                            clean[..clean.char_indices().take(200).last().map(|(i, _)| i).unwrap_or(200)].to_string()
+                        } else {
+                            clean
+                        }
+                    });
+
+                // Fetch has_attachments from email_index
+                let has_attachments: Option<bool> = conn
+                    .query_row(
+                        "SELECT has_attachments FROM email_index WHERE message_id = CAST(REPLACE(?1, 'mail://', '') AS INTEGER)",
+                        params![synthetic_path],
+                        |row| row.get::<_, Option<bool>>(0),
+                    )
+                    .unwrap_or(None);
+
                 results.push(EmailSearchResult {
                     subject,
                     sender,
@@ -599,6 +703,9 @@ end tell"#,
                     mailbox,
                     chunk,
                     similarity: vr.similarity,
+                    sender_name,
+                    preview,
+                    has_attachments,
                 });
             }
         }
@@ -622,7 +729,8 @@ end tell"#,
         let conn = self.open_connection()?;
         let mut stmt = conn
             .prepare(
-                "SELECT fc.content, fc.vector, fi.name, fi.path, ei.subject, ei.sender, ei.date_received, ei.mailbox
+                "SELECT fc.content, fc.vector, fi.name, fi.path,
+                        ei.subject, ei.sender, ei.date_received, ei.mailbox, ei.has_attachments
                  FROM file_chunks fc
                  JOIN file_index fi ON fc.file_path = fi.path
                  JOIN email_index ei ON fi.path = 'mail://' || CAST(ei.message_id AS TEXT)
@@ -635,15 +743,31 @@ end tell"#,
                 let content: String = row.get(0)?;
                 let vector_bytes: Vec<u8> = row.get(1)?;
                 let _name: String = row.get(2)?;
-                let _path: String = row.get(3)?;
+                let path: String = row.get(3)?;
                 let subject: String = row.get(4)?;
                 let sender: String = row.get(5)?;
                 let date: String = row.get(6)?;
                 let mailbox: String = row.get(7)?;
+                let has_attachments: Option<bool> = row.get(8)?;
 
                 let vector = bytes_to_vector(&vector_bytes);
                 let similarity =
                     crate::brain::utils::cosine_similarity(query_vector, &vector) as f64;
+
+                let sender_name = parse_sender_name(&sender);
+
+                // Build preview from the chunk content (first chunk provides preview)
+                let _ = &path; // used later for preview if needed
+                let preview = {
+                    let clean = content.replace('\n', " ").replace('\r', "");
+                    if clean.len() > 200 {
+                        Some(clean[..clean.char_indices().take(200).last().map(|(i, _)| i).unwrap_or(200)].to_string())
+                    } else if !clean.is_empty() {
+                        Some(clean)
+                    } else {
+                        None
+                    }
+                };
 
                 Ok(EmailSearchResult {
                     subject,
@@ -652,6 +776,9 @@ end tell"#,
                     mailbox,
                     chunk: content,
                     similarity,
+                    sender_name,
+                    preview,
+                    has_attachments,
                 })
             })
             .map_err(|e| format!("Email search failed: {}", e))?
@@ -693,6 +820,52 @@ end tell"#,
             is_indexing,
         })
     }
+
+    /// List recent indexed emails from SQLite cache (no AppleScript).
+    ///
+    /// Returns `MailSearchResult`-compatible data sorted by date descending.
+    pub fn list_recent(&self, limit: u32) -> Result<Vec<crate::commands::MailSearchResult>, String> {
+        let conn = self.open_connection()?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT ei.message_id, ei.subject, ei.sender, ei.date_received,
+                        ei.account, ei.mailbox,
+                        COALESCE(fc.content, '')
+                 FROM email_index ei
+                 LEFT JOIN file_chunks fc
+                   ON fc.file_path = 'mail://' || CAST(ei.message_id AS TEXT)
+                   AND fc.chunk_index = 0
+                 ORDER BY ei.indexed_at DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| format!("Query failed: {}", e))?;
+
+        let results = stmt
+            .query_map(params![limit], |row| {
+                let body: String = row.get(6)?;
+                // Truncate body to 200 chars for preview
+                let preview = if body.len() > 200 {
+                    body[..body.char_indices().take(200).last().map(|(i, _)| i).unwrap_or(200)].to_string()
+                } else {
+                    body
+                };
+                Ok(crate::commands::MailSearchResult {
+                    message_id: row.get(0)?,
+                    subject: row.get(1)?,
+                    sender: row.get(2)?,
+                    date: row.get(3)?,
+                    account: row.get(4)?,
+                    mailbox: row.get(5)?,
+                    preview: preview.replace('\n', " ").replace('\r', ""),
+                })
+            })
+            .map_err(|e| format!("List recent emails failed: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
 }
 
 /// Email search result
@@ -704,6 +877,25 @@ pub struct EmailSearchResult {
     pub mailbox: String,
     pub chunk: String,
     pub similarity: f64,
+    // Enhanced fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_attachments: Option<bool>,
+}
+
+/// Parse the display name from a sender string like "Jane Smith <jane@example.com>".
+/// Returns None if no angle brackets are found or the name portion is empty.
+fn parse_sender_name(sender: &str) -> Option<String> {
+    if let Some(idx) = sender.find('<') {
+        let name = sender[..idx].trim().trim_matches('"');
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 fn vector_to_bytes(vector: &[f32]) -> Vec<u8> {

@@ -44,6 +44,7 @@ struct RecallRequest {
 struct FileSearchRequest {
     query: String,
     limit: Option<u32>,
+    include_preview: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +112,40 @@ struct FileChunksRequest {
     limit: Option<u32>,
 }
 
+// ---- Activity types ----
+
+// ---- Graph / GNN / Compression request types ----
+
+#[derive(Deserialize)]
+struct GraphNeighborsRequest {
+    node_id: String,
+    hops: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct GnnRerankRequest {
+    query: String,
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ActivityStreamRequest {
+    since: String,
+    until: Option<String>,
+    types: Option<Vec<String>>,
+    project: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ActivityConfigureRequest {
+    activity_tracking_enabled: Option<bool>,
+    activity_excluded_apps: Option<Vec<String>>,
+    activity_track_browser: Option<bool>,
+    activity_track_terminal: Option<bool>,
+    activity_retention_days: Option<u32>,
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     ok: bool,
@@ -140,23 +175,12 @@ async fn auth_middleware(
     request: axum::extract::Request,
     next: Next,
 ) -> impl IntoResponse {
-    // Load token: prefer Keychain, fall back to settings
-    let expected = crate::keychain::get_secret("api_token")
-        .ok()
-        .flatten()
-        .or_else(|| state.settings.read().api_token.clone())
-        .unwrap_or_default();
+    // Load token from in-memory settings (fast, set at startup).
+    // Avoids Keychain access on every request which can be slow.
+    let expected = state.settings.read().api_token.clone().unwrap_or_default();
 
     if expected.is_empty() {
-        // No token configured — auto-generate one and store in Keychain
-        let generated = uuid::Uuid::new_v4().to_string();
-        let _ = crate::keychain::store_secret("api_token", &generated);
-        tracing::info!(
-            "No API token found. Generated and stored in Keychain. Token: {}",
-            generated
-        );
-        // Allow this first request through so the user can discover the token
-        // via `security find-generic-password -s DeepBrain -a api_token -w`
+        // No token in settings — allow request through (shouldn't happen)
         return Ok(next.run(request).await);
     }
 
@@ -315,17 +339,24 @@ async fn api_search_files(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<FileSearchRequest>,
 ) -> Result<Json<Vec<crate::indexer::FileResult>>, (StatusCode, Json<ErrorResponse>)> {
-    state
+    let mut results = state
         .indexer
         .search(&body.query, body.limit.unwrap_or(10))
         .await
-        .map(Json)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { error: e }),
             )
-        })
+        })?;
+
+    if body.include_preview.unwrap_or(false) {
+        for result in &mut results {
+            crate::indexer::enrich_result(result);
+        }
+    }
+
+    Ok(Json(results))
 }
 
 async fn api_workflow(
@@ -416,18 +447,25 @@ async fn api_email_stats(
 
 async fn api_index_emails(
     AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .email_indexer
-        .index_pass(100)
-        .await
-        .map(|count| Json(serde_json::json!({ "indexed": count })))
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
+) -> Json<serde_json::Value> {
+    // Spawn email indexing on a dedicated thread with its own tokio runtime.
+    let email_indexer = Arc::clone(&state.email_indexer);
+    std::thread::Builder::new()
+        .name("email-indexer".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build email indexer runtime");
+            rt.block_on(async move {
+                match email_indexer.index_pass(100).await {
+                    Ok(count) => tracing::info!("Background email index pass complete: {} emails", count),
+                    Err(e) => tracing::error!("Background email index pass failed: {}", e),
+                }
+            });
         })
+        .ok();
+    Json(serde_json::json!({ "status": "email_index_started" }))
 }
 
 // ---- Storage: health metrics (RVF) ----
@@ -737,10 +775,26 @@ async fn api_file_chunks(
 
 async fn api_index_files(
     AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state.indexer.scan_all().await
-        .map(|count| Json(serde_json::json!({ "indexed": count })))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))
+) -> Json<serde_json::Value> {
+    // Spawn indexing on a dedicated thread with its own tokio runtime
+    // so that it never blocks the main API runtime.
+    let indexer = Arc::clone(&state.indexer);
+    std::thread::Builder::new()
+        .name("file-indexer".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build indexer runtime");
+            rt.block_on(async move {
+                match indexer.scan_all().await {
+                    Ok(count) => tracing::info!("Background file scan complete: {} files indexed", count),
+                    Err(e) => tracing::error!("Background file scan failed: {}", e),
+                }
+            });
+        })
+        .ok();
+    Json(serde_json::json!({ "status": "scan_started" }))
 }
 
 async fn api_add_folder(
@@ -757,12 +811,28 @@ async fn api_add_folder(
     {
         let mut settings = state.settings.write();
         if !settings.indexed_folders.contains(&body.path) {
-            settings.indexed_folders.push(body.path);
+            settings.indexed_folders.push(body.path.clone());
         }
     }
-    let count = state.indexer.scan_all().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
-    Ok(Json(serde_json::json!({ "indexed": count })))
+    // Spawn scan on a dedicated thread so the API stays responsive.
+    let indexer = Arc::clone(&state.indexer);
+    let path = body.path.clone();
+    std::thread::Builder::new()
+        .name("folder-indexer".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build folder indexer runtime");
+            rt.block_on(async move {
+                match indexer.scan_all().await {
+                    Ok(count) => tracing::info!("Background folder scan complete: {} files indexed", count),
+                    Err(e) => tracing::error!("Background folder scan failed: {}", e),
+                }
+            });
+        })
+        .ok();
+    Ok(Json(serde_json::json!({ "status": "folder_added", "path": path })))
 }
 
 // ---- Ollama status ----
@@ -780,14 +850,367 @@ async fn api_common_folders() -> Json<Vec<commands::CommonFolder>> {
     Json(commands::get_common_folders())
 }
 
-// ---- Recent emails ----
+// ---- Recent emails (from SQLite cache, no AppleScript) ----
 
-async fn api_recent_emails() -> Result<Json<Vec<commands::MailSearchResult>>, (StatusCode, Json<ErrorResponse>)> {
-    // Use mdfind-based search for recent emails (no AppleScript requirement)
-    commands::mdfind_email_search_impl("".to_string(), Some(30))
-        .await
+async fn api_recent_emails(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<Vec<commands::MailSearchResult>>, (StatusCode, Json<ErrorResponse>)> {
+    state.email_indexer.list_recent(30)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))
+}
+
+// ---- Folder awareness ----
+
+#[derive(Deserialize)]
+struct ListFoldersRequest {
+    path: Option<String>,
+}
+
+async fn api_list_folders(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<ListFoldersRequest>,
+) -> Result<Json<Vec<commands::FolderEntry>>, (StatusCode, Json<ErrorResponse>)> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let target = match body.path {
+        Some(ref p) => std::path::PathBuf::from(p),
+        None => home,
+    };
+
+    if !target.exists() || !target.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: format!("Not a directory: {}", target.display()) }),
+        ));
+    }
+
+    let settings = state.settings.read();
+    let indexed_folders: Vec<String> = settings.indexed_folders.clone();
+    drop(settings);
+
+    let mut entries: Vec<commands::FolderEntry> = Vec::new();
+    let read_dir = std::fs::read_dir(&target)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Cannot read: {}", e) })))?;
+
+    for entry in read_dir.flatten() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() { continue; }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') { continue; }
+
+        let entry_path = entry.path();
+        let path_str = entry_path.to_string_lossy().to_string();
+
+        let (item_count, subfolder_count) = match std::fs::read_dir(&entry_path) {
+            Ok(children) => {
+                let mut items = 0u32;
+                let mut subs = 0u32;
+                for child in children.flatten() {
+                    let cn = child.file_name().to_string_lossy().to_string();
+                    if cn.starts_with('.') { continue; }
+                    items += 1;
+                    if child.file_type().map(|ft| ft.is_dir()).unwrap_or(false) { subs += 1; }
+                }
+                (items, subs)
+            }
+            Err(_) => (0, 0),
+        };
+
+        let modified = entry.metadata().ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+            })
+            .unwrap_or_default();
+
+        let is_indexed = indexed_folders.iter()
+            .any(|f| path_str.starts_with(f) || f.starts_with(&path_str));
+
+        entries.push(commands::FolderEntry {
+            name, path: path_str, item_count, subfolder_count, modified, is_indexed,
+        });
+    }
+    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(Json(entries))
+}
+
+// ---- Activity ----
+
+async fn api_activity_current(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<crate::activity::CurrentActivity> {
+    let mut current = state.activity.current();
+    // Merge clipboard from ContextManager
+    current.recent_clipboard = state.context.last_clipboard();
+    Json(current)
+}
+
+async fn api_activity_stream(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<ActivityStreamRequest>,
+) -> Result<Json<Vec<crate::activity::ActivityEvent>>, (StatusCode, Json<ErrorResponse>)> {
+    let since_ms = chrono::DateTime::parse_from_rfc3339(&body.since)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid 'since' timestamp: {}", e),
+                }),
+            )
+        })?;
+
+    let until_ms = body
+        .until
+        .as_deref()
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.timestamp_millis())
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("Invalid 'until' timestamp: {}", e),
+                        }),
+                    )
+                })
+        })
+        .transpose()?;
+
+    let types_ref = body.types.as_deref();
+    let project_ref = body.project.as_deref();
+    let limit = body.limit.unwrap_or(100);
+
+    let events = state
+        .activity
+        .stream(since_ms, until_ms, types_ref, project_ref, limit);
+
+    Ok(Json(events))
+}
+
+async fn api_activity_configure(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<ActivityConfigureRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    // Read current settings and apply partial updates
+    let mut current = state.activity.settings();
+
+    if let Some(enabled) = body.activity_tracking_enabled {
+        current.enabled = enabled;
+    }
+    if let Some(ref excluded) = body.activity_excluded_apps {
+        current.excluded_apps = excluded.clone();
+    }
+    if let Some(browser) = body.activity_track_browser {
+        current.track_browser = browser;
+    }
+    if let Some(terminal) = body.activity_track_terminal {
+        current.track_terminal = terminal;
+    }
+    if let Some(retention) = body.activity_retention_days {
+        current.retention_days = retention;
+    }
+
+    // Update observer settings
+    state.activity.update_settings(current.clone());
+
+    // Persist to AppSettings
+    {
+        let mut settings = state.settings.write();
+        settings.activity_tracking_enabled = current.enabled;
+        settings.activity_excluded_apps = current.excluded_apps.clone();
+        settings.activity_track_browser = current.track_browser;
+        settings.activity_track_terminal = current.track_terminal;
+        settings.activity_retention_days = current.retention_days;
+    }
+
+    // Save to disk
+    let settings = state.settings.read().clone();
+    let mut persist = settings;
+    persist.claude_api_key = None;
+    persist.api_token = None;
+    let json = serde_json::to_string(&persist).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("{}", e),
+            }),
+        )
+    })?;
+    state.persistence.store_config("app_settings", &json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---- Projects ----
+
+async fn api_projects(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    // Gather projects from activity events
+    let activity_projects = state.activity.projects();
+
+    // Gather projects from file index
+    let file_projects = state
+        .indexer
+        .projects()
+        .unwrap_or_default();
+
+    // Merge: activity provides last_active, file index provides indexed_files/indexed_chunks
+    let mut merged: std::collections::HashMap<String, crate::activity::ProjectInfo> =
+        std::collections::HashMap::new();
+
+    for ap in activity_projects {
+        merged
+            .entry(ap.name.clone())
+            .and_modify(|existing| {
+                // Keep earliest last_active
+                if existing.last_active.is_none() {
+                    existing.last_active = ap.last_active.clone();
+                }
+            })
+            .or_insert(ap);
+    }
+
+    for fp in file_projects {
+        merged
+            .entry(fp.name.clone())
+            .and_modify(|existing| {
+                existing.indexed_files = fp.indexed_files;
+                existing.indexed_chunks = fp.indexed_chunks;
+                if existing.path.is_none() {
+                    existing.path = fp.path.clone();
+                }
+            })
+            .or_insert(fp);
+    }
+
+    let mut projects: Vec<crate::activity::ProjectInfo> = merged.into_values().collect();
+    projects.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+
+    Ok(Json(serde_json::json!({ "projects": projects })))
+}
+
+// ---- Knowledge Graph ----
+
+async fn api_graph_stats(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<crate::deepbrain::graph_bridge::GraphStats> {
+    Json(state.graph.stats())
+}
+
+async fn api_graph_neighbors(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<GraphNeighborsRequest>,
+) -> Json<Vec<String>> {
+    let hops = body.hops.unwrap_or(1);
+    Json(state.graph.k_hop_neighbors(&body.node_id, hops))
+}
+
+// ---- GNN Re-ranking ----
+
+async fn api_gnn_rerank(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<GnnRerankRequest>,
+) -> Result<Json<Vec<crate::deepbrain::gnn_bridge::RankedResult>>, (StatusCode, Json<ErrorResponse>)> {
+    let embedding = state.embeddings.embed(&body.query).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
+    })?;
+
+    let limit = body.limit.unwrap_or(10);
+    let recall_results = state
+        .engine
+        .recall_f32(&embedding, Some(limit), None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+
+    let candidates: Vec<crate::deepbrain::gnn_bridge::RerankCandidate> = recall_results
+        .iter()
+        .filter_map(|r| {
+            state.engine.memory.get(&r.id).map(|entry| {
+                // Get vector from the memory node
+                let node = state.engine.memory.all_nodes().into_iter().find(|n| n.id == r.id);
+                let emb = node.map(|n| n.vector.clone()).unwrap_or_default();
+                crate::deepbrain::gnn_bridge::RerankCandidate {
+                    id: r.id.clone(),
+                    content: r.content.clone(),
+                    embedding: emb,
+                    vector_score: r.similarity,
+                }
+            })
+        })
+        .collect();
+
+    let graph = state.graph.clone();
+    let engine = state.engine.clone();
+    let results = state.gnn.rerank(&embedding, &candidates, &|node_id| {
+        let neighbor_ids = graph.k_hop_neighbors(node_id, 1);
+        neighbor_ids
+            .into_iter()
+            .filter_map(|nid| {
+                engine.memory.all_nodes().into_iter().find(|n| n.id == nid).map(|n| {
+                    crate::deepbrain::gnn_bridge::NeighborInfo {
+                        id: n.id.clone(),
+                        embedding: n.vector.clone(),
+                        edge_weight: 1.0,
+                    }
+                })
+            })
+            .collect()
+    });
+
+    Ok(Json(results))
+}
+
+async fn api_gnn_save_weights(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let json = state.gnn.to_json().map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
+    })?;
+    state.persistence.store_blob("gnn_weights", json.as_bytes()).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---- Tensor Compression ----
+
+async fn api_compression_scan(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<crate::deepbrain::compress_bridge::CompressionStats> {
+    let nodes = state.engine.memory.all_nodes();
+    let mem_stats = state.engine.memory.stats();
+    let total_accesses = mem_stats.total_accesses as u64;
+
+    let memories: Vec<crate::deepbrain::compress_bridge::MemoryForCompression> = nodes
+        .iter()
+        .map(|n| crate::deepbrain::compress_bridge::MemoryForCompression {
+            id: n.id.clone(),
+            access_count: n.access_count,
+            vector_len: n.vector.len(),
+        })
+        .collect();
+
+    Json(state.compressor.scan(&memories, total_accesses))
+}
+
+async fn api_compression_stats(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let stats = state.engine.memory.stats();
+    Json(serde_json::json!({
+        "total_memories": stats.total_memories,
+        "total_accesses": stats.total_accesses,
+    }))
 }
 
 // ---- Server startup ----
@@ -851,6 +1274,22 @@ pub async fn start_api_server(state: Arc<AppState>, port: u16) {
         .route("/api/ollama/status", get(api_check_ollama))
         // Folders
         .route("/api/folders/common", get(api_common_folders))
+        .route("/api/folders/list", post(api_list_folders))
+        // Activity
+        .route("/api/activity/current", get(api_activity_current))
+        .route("/api/activity/stream", post(api_activity_stream))
+        .route("/api/activity/configure", post(api_activity_configure))
+        // Projects
+        .route("/api/projects", get(api_projects))
+        // Knowledge Graph
+        .route("/api/graph/stats", get(api_graph_stats))
+        .route("/api/graph/neighbors", post(api_graph_neighbors))
+        // GNN Re-ranking
+        .route("/api/gnn/rerank", post(api_gnn_rerank))
+        .route("/api/gnn/save-weights", post(api_gnn_save_weights))
+        // Tensor Compression
+        .route("/api/compression/scan", post(api_compression_scan))
+        .route("/api/compression/stats", get(api_compression_stats))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // CORS layer for browser access

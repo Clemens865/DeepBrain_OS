@@ -126,7 +126,41 @@ pub async fn think_impl(input: &str, state: &AppState) -> Result<ThinkResponse, 
 
     // Get memory-based response and recall relevant memories
     let brain_result = state.engine.think_with_embedding(input, &embedding)?;
-    let memories = state.engine.recall_f32(&embedding, Some(5), None).unwrap_or_default();
+    let mut memories = state.engine.recall_f32(&embedding, Some(5), None).unwrap_or_default();
+
+    // Graph augmentation: for top-3 results, find 1-hop graph neighbors
+    // and add any graph-discovered memories not already in results.
+    {
+        let existing_ids: std::collections::HashSet<String> =
+            memories.iter().map(|m| m.id.clone()).collect();
+        let mut graph_additions = Vec::new();
+
+        for memory in memories.iter().take(3) {
+            let neighbors = state.graph.k_hop_neighbors(&memory.id, 1);
+            for neighbor_id in neighbors {
+                if !existing_ids.contains(&neighbor_id)
+                    && !graph_additions.iter().any(|a: &crate::brain::cognitive::RecallResult| a.id == neighbor_id)
+                {
+                    if let Some(entry) = state.engine.memory.get(&neighbor_id) {
+                        graph_additions.push(crate::brain::cognitive::RecallResult {
+                            id: entry.id,
+                            content: entry.content,
+                            similarity: 0.4, // Graph-discovered baseline similarity
+                            memory_type: entry.memory_type,
+                        });
+                    }
+                }
+            }
+        }
+
+        if !graph_additions.is_empty() {
+            tracing::debug!(
+                "Graph augmentation added {} memories to recall",
+                graph_additions.len()
+            );
+            memories.extend(graph_additions);
+        }
+    }
 
     // Gather additional context: indexed emails + mdfind email + Spotlight + file index search (in parallel)
     // mdfind email search replaces the unreliable AppleScript live search (with AppleScript fallback)
@@ -263,6 +297,11 @@ pub async fn remember(
 ) -> Result<RememberResponse, String> {
     let embedding = state.embeddings.embed(&content).await?;
 
+    // Clone values needed after the move into remember_with_embedding
+    let content_for_graph = content.clone();
+    let memory_type_for_graph = memory_type.clone();
+    let embedding_for_graph = embedding.clone();
+
     let id = state.engine.remember_with_embedding(
         content,
         embedding,
@@ -277,6 +316,44 @@ pub async fn remember(
         nodes.into_iter().find(|n| n.id == id)
     } {
         let _ = state.persistence.store_memory(&node);
+    }
+
+    // Graph: add memory node and auto-connect to similar memories
+    {
+        let _ = state.graph.add_memory_node(&id, &memory_type_for_graph, &content_for_graph);
+
+        // Find similar memories for graph connections
+        let similar = state
+            .engine
+            .recall_f32(&embedding_for_graph, Some(5), None)
+            .unwrap_or_default();
+        let related_ids: Vec<String> = similar
+            .iter()
+            .filter(|s| s.id != id && s.similarity > 0.5)
+            .map(|s| s.id.clone())
+            .collect();
+
+        if !related_ids.is_empty() {
+            let edges_created = state.graph.auto_connect(&id, &related_ids, 0.6);
+            if edges_created > 0 {
+                tracing::debug!(
+                    "Graph: auto-connected memory {} to {} neighbors",
+                    id,
+                    edges_created
+                );
+            }
+
+            // Create cluster hyperedge if 3+ related
+            if related_ids.len() >= 2 {
+                let mut cluster_ids = vec![id.clone()];
+                cluster_ids.extend(related_ids.iter().take(4).cloned());
+                let _ = state.graph.create_cluster_hyperedge(
+                    &cluster_ids,
+                    &format!("Auto-cluster around {}", &content_for_graph.chars().take(50).collect::<String>()),
+                    0.6,
+                );
+            }
+        }
     }
 
     let memory_count = state.engine.memory.len();
@@ -1166,6 +1243,123 @@ pub fn get_common_folders() -> Vec<CommonFolder> {
         .collect()
 }
 
+// ---- Folder Awareness ----
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FolderEntry {
+    /// Folder name (last path component).
+    pub name: String,
+    /// Full absolute path.
+    pub path: String,
+    /// Number of immediate child items (files + folders).
+    pub item_count: u32,
+    /// Number of immediate child subdirectories.
+    pub subfolder_count: u32,
+    /// Last modification time as ISO 8601 string.
+    pub modified: String,
+    /// Whether this folder is currently indexed by DeepBrain.
+    pub is_indexed: bool,
+}
+
+/// List subdirectories of a given path.
+///
+/// If `path` is None, lists the home directory.
+/// Returns only directories (not files) — the UI can call `list_indexed_files`
+/// with a folder filter to see files within a folder.
+#[tauri::command]
+pub fn list_folders(
+    path: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<FolderEntry>, String> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let target = match path {
+        Some(ref p) => std::path::Path::new(p).to_path_buf(),
+        None => home,
+    };
+
+    if !target.exists() || !target.is_dir() {
+        return Err(format!("Not a directory: {}", target.display()));
+    }
+
+    // Sanitize: prevent traversal outside home
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve path: {}", e))?;
+
+    let settings = state.settings.read();
+    let indexed_folders: Vec<String> = settings.indexed_folders.clone();
+
+    let mut entries: Vec<FolderEntry> = Vec::new();
+
+    let read_dir = std::fs::read_dir(&canonical)
+        .map_err(|e| format!("Cannot read directory: {}", e))?;
+
+    for entry in read_dir.flatten() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Skip hidden directories
+        if name.starts_with('.') {
+            continue;
+        }
+
+        let entry_path = entry.path();
+        let path_str = entry_path.to_string_lossy().to_string();
+
+        // Count immediate children
+        let (item_count, subfolder_count) = match std::fs::read_dir(&entry_path) {
+            Ok(children) => {
+                let mut items = 0u32;
+                let mut subs = 0u32;
+                for child in children.flatten() {
+                    let child_name = child.file_name().to_string_lossy().to_string();
+                    if child_name.starts_with('.') {
+                        continue;
+                    }
+                    items += 1;
+                    if child.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                        subs += 1;
+                    }
+                }
+                (items, subs)
+            }
+            Err(_) => (0, 0),
+        };
+
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+            })
+            .unwrap_or_default();
+
+        let is_indexed = indexed_folders
+            .iter()
+            .any(|f| path_str.starts_with(f) || f.starts_with(&path_str));
+
+        entries.push(FolderEntry {
+            name,
+            path: path_str,
+            item_count,
+            subfolder_count,
+            modified,
+            is_indexed,
+        });
+    }
+
+    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(entries)
+}
+
 #[tauri::command]
 pub async fn pick_folder() -> Result<Option<String>, String> {
     let output = tokio::process::Command::new("osascript")
@@ -1188,81 +1382,15 @@ pub async fn pick_folder() -> Result<Option<String>, String> {
     }
 }
 
-// ---- Recent Emails ----
+// ---- Recent Emails (cached from SQLite) ----
 
 #[tauri::command]
-pub async fn get_recent_emails(limit: Option<u32>) -> Result<Vec<MailSearchResult>, String> {
+pub fn get_recent_emails(
+    limit: Option<u32>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<MailSearchResult>, String> {
     let limit = limit.unwrap_or(30);
-
-    let script = format!(
-        r#"tell application "Mail"
-  set output to ""
-  set resultCount to 0
-  set msgs to messages of inbox
-  set maxCount to count of msgs
-  if maxCount > {limit} then set maxCount to {limit}
-  repeat with i from 1 to maxCount
-    set m to item i of msgs
-    set subj to subject of m
-    set sndr to sender of m
-    set dt to (date received of m) as string
-    set prev to ""
-    try
-      set prev to (content of m)
-      if (length of prev) > 200 then set prev to (text 1 through 200 of prev)
-    end try
-    set msgId to (id of m) as string
-    set acctName to ""
-    try
-      set acctName to name of account of mailbox of m
-    end try
-    set mboxName to ""
-    try
-      set mboxName to name of mailbox of m
-    end try
-    set output to output & subj & "␞" & sndr & "␞" & dt & "␞" & prev & "␞" & acctName & "␞" & mboxName & "␞" & msgId & "␟"
-    set resultCount to resultCount + 1
-  end repeat
-  return output
-end tell"#,
-        limit = limit,
-    );
-
-    let output = tokio::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .await
-        .map_err(|e| format!("osascript failed: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to get recent emails: {}", stderr));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let results: Vec<MailSearchResult> = stdout
-        .split('␟')
-        .filter(|s| !s.trim().is_empty())
-        .filter_map(|record| {
-            let fields: Vec<&str> = record.split('␞').collect();
-            if fields.len() >= 7 {
-                Some(MailSearchResult {
-                    subject: fields[0].trim().to_string(),
-                    sender: fields[1].trim().to_string(),
-                    date: fields[2].trim().to_string(),
-                    preview: fields[3].trim().replace('\n', " ").replace('\r', ""),
-                    account: fields[4].trim().to_string(),
-                    mailbox: fields[5].trim().to_string(),
-                    message_id: fields[6].trim().parse().unwrap_or(0),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    Ok(results)
+    state.email_indexer.list_recent(limit)
 }
 
 // ---- Email Semantic Search (indexed/embedded emails) ----
@@ -1586,6 +1714,114 @@ pub fn bootstrap_sona(
     state: State<'_, Arc<AppState>>,
 ) -> Result<BootstrapResult, String> {
     bootstrap_sona_impl(&state)
+}
+
+// ---- Knowledge Graph ----
+
+#[tauri::command]
+pub fn graph_stats(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::deepbrain::graph_bridge::GraphStats, String> {
+    Ok(state.graph.stats())
+}
+
+#[tauri::command]
+pub fn graph_neighbors(
+    node_id: String,
+    hops: Option<u32>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<String>, String> {
+    Ok(state.graph.k_hop_neighbors(&node_id, hops.unwrap_or(1)))
+}
+
+// ---- GNN Re-ranking ----
+
+#[tauri::command]
+pub async fn gnn_rerank(
+    query: String,
+    limit: Option<u32>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::deepbrain::gnn_bridge::RankedResult>, String> {
+    let embedding = state.embeddings.embed(&query).await?;
+    let limit = limit.unwrap_or(10);
+
+    let recall_results = state
+        .engine
+        .recall_f32(&embedding, Some(limit), None)?;
+
+    let candidates: Vec<crate::deepbrain::gnn_bridge::RerankCandidate> = recall_results
+        .iter()
+        .filter_map(|r| {
+            let node = state.engine.memory.all_nodes().into_iter().find(|n| n.id == r.id)?;
+            Some(crate::deepbrain::gnn_bridge::RerankCandidate {
+                id: r.id.clone(),
+                content: r.content.clone(),
+                embedding: node.vector.clone(),
+                vector_score: r.similarity,
+            })
+        })
+        .collect();
+
+    let graph = state.graph.clone();
+    let engine = state.engine.clone();
+    let results = state.gnn.rerank(&embedding, &candidates, &|node_id| {
+        let neighbor_ids = graph.k_hop_neighbors(node_id, 1);
+        neighbor_ids
+            .into_iter()
+            .filter_map(|nid| {
+                engine.memory.all_nodes().into_iter().find(|n| n.id == nid).map(|n| {
+                    crate::deepbrain::gnn_bridge::NeighborInfo {
+                        id: n.id.clone(),
+                        embedding: n.vector.clone(),
+                        edge_weight: 1.0,
+                    }
+                })
+            })
+            .collect()
+    });
+
+    Ok(results)
+}
+
+#[tauri::command]
+pub fn gnn_save_weights(
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let json = state.gnn.to_json()?;
+    state.persistence.store_blob("gnn_weights", json.as_bytes())
+}
+
+// ---- Tensor Compression ----
+
+#[tauri::command]
+pub fn compression_scan(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::deepbrain::compress_bridge::CompressionStats, String> {
+    let nodes = state.engine.memory.all_nodes();
+    let mem_stats = state.engine.memory.stats();
+    let total_accesses = mem_stats.total_accesses as u64;
+
+    let memories: Vec<crate::deepbrain::compress_bridge::MemoryForCompression> = nodes
+        .iter()
+        .map(|n| crate::deepbrain::compress_bridge::MemoryForCompression {
+            id: n.id.clone(),
+            access_count: n.access_count,
+            vector_len: n.vector.len(),
+        })
+        .collect();
+
+    Ok(state.compressor.scan(&memories, total_accesses))
+}
+
+#[tauri::command]
+pub fn compression_stats(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let stats = state.engine.memory.stats();
+    Ok(serde_json::json!({
+        "total_memories": stats.total_memories,
+        "total_accesses": stats.total_accesses,
+    }))
 }
 
 // ---- Flush (save to disk) ----

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod activity;
 pub mod ai;
 pub mod api;
 pub mod autostart;
