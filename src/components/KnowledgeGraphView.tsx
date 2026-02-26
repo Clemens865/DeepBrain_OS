@@ -7,7 +7,9 @@ import { invoke } from "../services/backend";
 interface GraphNode {
   id: string;
   label: string;
+  content: string;
   memoryType: string;
+  importance: number;
   x: number;
   y: number;
   vx: number;
@@ -26,6 +28,11 @@ interface Camera {
   scale: number;
 }
 
+interface SelectedInfo {
+  node: GraphNode;
+  connections: GraphNode[];
+}
+
 /* ── Constants ─────────────────────────────────────────────────── */
 
 const TYPE_COLORS: Record<string, string> = {
@@ -39,6 +46,7 @@ const TYPE_COLORS: Record<string, string> = {
   emotional: "#f97316",
 };
 
+const MEMORY_TYPES = Object.keys(TYPE_COLORS);
 const DEFAULT_COLOR = "#64748b";
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -86,12 +94,13 @@ export default function KnowledgeGraphView() {
 
   // Camera & simulation
   const cameraRef = useRef<Camera>({ x: 0, y: 0, scale: 1 });
+  const cameraTargetRef = useRef<{ x: number; y: number } | null>(null);
   const alphaRef = useRef(1.0);
 
-  // React state (only for UI that needs re-render)
+  // React state (for UI that needs re-render)
   const [stats, setStats] = useState<GraphStats | null>(null);
   const [loading, setLoading] = useState(true);
-  // hoveredRef is read directly by the render loop (no React state needed)
+  const [selected, setSelected] = useState<SelectedInfo | null>(null);
 
   /* ── Build neighbor lookup ───────────────────────────────────── */
 
@@ -106,50 +115,113 @@ export default function KnowledgeGraphView() {
     neighborMapRef.current = map;
   }, []);
 
-  /* ── Load graph data ─────────────────────────────────────────── */
+  /* ── Select a node (updates ref + React state + camera target) ── */
+
+  const selectNode = useCallback(
+    (nodeId: string | null) => {
+      selectedRef.current = nodeId;
+      if (!nodeId) {
+        setSelected(null);
+        return;
+      }
+      const node = nodeMapRef.current.get(nodeId);
+      if (!node) {
+        setSelected(null);
+        return;
+      }
+      // Build connections list
+      const neighborIds = neighborMapRef.current.get(nodeId) ?? new Set();
+      const connections: GraphNode[] = [];
+      for (const nId of neighborIds) {
+        const n = nodeMapRef.current.get(nId);
+        if (n) connections.push(n);
+      }
+      connections.sort((a, b) => b.degree - a.degree);
+      setSelected({ node, connections });
+      // Pan camera to center on node
+      cameraTargetRef.current = { x: node.x, y: node.y };
+    },
+    []
+  );
+
+  /* ── Load graph data (per-type for diversity) ───────────────── */
 
   const loadGraphData = useCallback(async () => {
     setLoading(true);
+    selectNode(null);
     try {
       const s = await invoke<GraphStats>("graph_stats").catch(() => null);
       setStats(s);
 
       if (s && s.node_count > 0) {
-        const memories = await invoke<
-          { id: string; content: string; memory_type: string }[]
-        >("list_memories", { memoryType: null, limit: 50, offset: 0 }).catch(
-          () => []
-        );
+        // Load memories per type for color diversity
+        const perType = 25;
+        const allMemories: {
+          id: string;
+          content: string;
+          memory_type: string;
+          importance: number;
+          connection_count: number;
+        }[] = [];
 
+        // Fire all type queries in parallel
+        const results = await Promise.all(
+          MEMORY_TYPES.map((t) =>
+            invoke<
+              {
+                id: string;
+                content: string;
+                memory_type: string;
+                importance: number;
+                connection_count: number;
+              }[]
+            >("list_memories", {
+              memoryType: t,
+              limit: perType,
+              offset: 0,
+            }).catch(() => [])
+          )
+        );
+        for (const batch of results) {
+          allMemories.push(...batch);
+        }
+
+        // Deduplicate
         const nodes: GraphNode[] = [];
-        const edges: GraphEdge[] = [];
         const nodeSet = new Set<string>();
         const nodeMap = new Map<string, GraphNode>();
         const edgeSet = new Set<string>();
+        const edges: GraphEdge[] = [];
 
-        // Place nodes in a tight circle — simulation will spread them out
-        const angleStep = (2 * Math.PI) / Math.max(memories.length, 1);
-        const initRadius = 60;
+        // Place nodes in a tight circle
+        const angleStep =
+          (2 * Math.PI) / Math.max(allMemories.length, 1);
+        const initRadius = 60 + allMemories.length * 0.5;
 
-        for (let i = 0; i < memories.length; i++) {
-          const m = memories[i];
+        let idx = 0;
+        for (const m of allMemories) {
           if (nodeSet.has(m.id)) continue;
           nodeSet.add(m.id);
-          const angle = i * angleStep;
+          const angle = idx * angleStep;
           const node: GraphNode = {
             id: m.id,
             label: m.content.slice(0, 60),
+            content: m.content,
             memoryType: m.memory_type,
+            importance: m.importance,
             x:
-              Math.cos(angle) * initRadius + (Math.random() - 0.5) * 20,
+              Math.cos(angle) * initRadius +
+              (Math.random() - 0.5) * 20,
             y:
-              Math.sin(angle) * initRadius + (Math.random() - 0.5) * 20,
+              Math.sin(angle) * initRadius +
+              (Math.random() - 0.5) * 20,
             vx: 0,
             vy: 0,
-            degree: 0,
+            degree: m.connection_count ?? 0,
           };
           nodes.push(node);
           nodeMap.set(m.id, node);
+          idx++;
         }
 
         // Discover edges
@@ -168,7 +240,8 @@ export default function KnowledgeGraphView() {
           }
         }
 
-        // Calculate degree
+        // Recalculate visible degree (edges within loaded set)
+        for (const n of nodes) n.degree = 0;
         for (const e of edges) {
           const a = nodeMap.get(e.from);
           const b = nodeMap.get(e.to);
@@ -182,6 +255,7 @@ export default function KnowledgeGraphView() {
         buildNeighborMap(edges);
         alphaRef.current = 1.0;
         cameraRef.current = { x: 0, y: 0, scale: 1 };
+        cameraTargetRef.current = null;
       } else {
         nodesRef.current = [];
         edgesRef.current = [];
@@ -192,7 +266,7 @@ export default function KnowledgeGraphView() {
       console.error("Failed to load graph data:", error);
     }
     setLoading(false);
-  }, [buildNeighborMap]);
+  }, [buildNeighborMap, selectNode]);
 
   useEffect(() => {
     loadDashboardData();
@@ -235,16 +309,15 @@ export default function KnowledgeGraphView() {
       const sy = e.clientY - rect.top;
       const cam = cameraRef.current;
 
-      // World position under mouse before zoom
       const wx = (sx - w / 2) / cam.scale + cam.x;
       const wy = (sy - h / 2) / cam.scale + cam.y;
 
       const factor = e.deltaY > 0 ? 0.92 : 1.08;
       cam.scale = Math.max(0.15, Math.min(6, cam.scale * factor));
 
-      // Keep world point under mouse after zoom
       cam.x = wx - (sx - w / 2) / cam.scale;
       cam.y = wy - (sy - h / 2) / cam.scale;
+      cameraTargetRef.current = null; // cancel any auto-pan
     };
 
     canvas.addEventListener("wheel", onWheel, { passive: false });
@@ -265,6 +338,7 @@ export default function KnowledgeGraphView() {
       const nodeMap = nodeMapRef.current;
       const neighbors = neighborMapRef.current;
       const cam = cameraRef.current;
+      const camTarget = cameraTargetRef.current;
       const dpr = window.devicePixelRatio || 1;
       const w = canvas.width / dpr;
       const h = canvas.height / dpr;
@@ -274,21 +348,39 @@ export default function KnowledgeGraphView() {
         ? neighbors.get(focusId) ?? new Set<string>()
         : null;
 
+      // Smooth camera pan toward target
+      if (camTarget) {
+        const dx = camTarget.x - cam.x;
+        const dy = camTarget.y - cam.y;
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
+          cam.x = camTarget.x;
+          cam.y = camTarget.y;
+          cameraTargetRef.current = null;
+        } else {
+          cam.x += dx * 0.12;
+          cam.y += dy * 0.12;
+        }
+      }
+
       // HiDPI transform
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
 
       /* ── Background ──────────────────────────────────────────── */
       const bgGrad = ctx.createRadialGradient(
-        w / 2, h / 2, 0,
-        w / 2, h / 2, Math.max(w, h) * 0.7
+        w / 2,
+        h / 2,
+        0,
+        w / 2,
+        h / 2,
+        Math.max(w, h) * 0.7
       );
       bgGrad.addColorStop(0, "#1e1f24");
       bgGrad.addColorStop(1, "#141518");
       ctx.fillStyle = bgGrad;
       ctx.fillRect(0, 0, w, h);
 
-      // Subtle dot grid (slight parallax with camera)
+      // Subtle dot grid
       const gs = 40;
       const gOffX = (((-cam.x * cam.scale * 0.3) % gs) + gs) % gs;
       const gOffY = (((-cam.y * cam.scale * 0.3) % gs) + gs) % gs;
@@ -307,7 +399,7 @@ export default function KnowledgeGraphView() {
         ctx.fillText(
           loading
             ? "Loading graph..."
-            : "No graph data yet. Memories will appear here as connections form.",
+            : "No graph data yet. Run bootstrap to populate memories.",
           w / 2,
           h / 2
         );
@@ -315,7 +407,7 @@ export default function KnowledgeGraphView() {
         return;
       }
 
-      /* ── Physics step (only while simulation active) ─────────── */
+      /* ── Physics step ────────────────────────────────────────── */
       if (alpha > 0.003) {
         const REPULSION = 500;
         const SPRING_K = 0.04;
@@ -324,7 +416,6 @@ export default function KnowledgeGraphView() {
         const DAMPING = 0.5;
         const MAX_VEL = 12;
 
-        // Repulsion between all node pairs
         for (let i = 0; i < nodes.length; i++) {
           for (let j = i + 1; j < nodes.length; j++) {
             const dx = nodes[j].x - nodes[i].x;
@@ -341,7 +432,6 @@ export default function KnowledgeGraphView() {
           }
         }
 
-        // Spring attraction along edges
         for (const e of edges) {
           const a = nodeMap.get(e.from);
           const b = nodeMap.get(e.to);
@@ -359,31 +449,25 @@ export default function KnowledgeGraphView() {
           b.vy -= fy;
         }
 
-        // Center gravity + velocity integration
         for (const n of nodes) {
           if (dragRef.current?.nodeId === n.id) {
             n.vx = 0;
             n.vy = 0;
             continue;
           }
-          // Pull toward origin (0,0)
           n.vx -= n.x * GRAVITY * alpha;
           n.vy -= n.y * GRAVITY * alpha;
-          // Damping
           n.vx *= DAMPING;
           n.vy *= DAMPING;
-          // Velocity cap
           const vel = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
           if (vel > MAX_VEL) {
             n.vx = (n.vx / vel) * MAX_VEL;
             n.vy = (n.vy / vel) * MAX_VEL;
           }
-          // Integrate
           n.x += n.vx;
           n.y += n.vy;
         }
 
-        // Cool down
         alphaRef.current *= 0.995;
       }
 
@@ -393,7 +477,6 @@ export default function KnowledgeGraphView() {
       ctx.scale(cam.scale, cam.scale);
       ctx.translate(-cam.x, -cam.y);
 
-      // Highlight helpers
       const isNodeLit = (id: string) =>
         !focusId || id === focusId || focusNeighbors!.has(id);
       const isEdgeLit = (from: string, to: string) => {
@@ -421,22 +504,30 @@ export default function KnowledgeGraphView() {
         ctx.stroke();
       }
 
-      /* ── Draw nodes (glow halo + core) ──────────────────────── */
+      /* ── Draw nodes ──────────────────────────────────────────── */
       for (const n of nodes) {
         const color = getColor(n.memoryType);
         const r = nodeRadius(n.degree);
         const lit = isNodeLit(n.id);
         const isFocused = n.id === focusId;
+        const isSelected = n.id === selectedRef.current;
         const nAlpha = lit ? 1.0 : 0.08;
 
         // Glow halo
         if (lit) {
           const glowR = r * (isFocused ? 4.5 : 2.5);
           const grad = ctx.createRadialGradient(
-            n.x, n.y, r * 0.3,
-            n.x, n.y, glowR
+            n.x,
+            n.y,
+            r * 0.3,
+            n.x,
+            n.y,
+            glowR
           );
-          grad.addColorStop(0, hexToRgba(color, isFocused ? 0.5 : 0.2));
+          grad.addColorStop(
+            0,
+            hexToRgba(color, isFocused ? 0.5 : 0.2)
+          );
           grad.addColorStop(1, hexToRgba(color, 0));
           ctx.fillStyle = grad;
           ctx.beginPath();
@@ -450,19 +541,38 @@ export default function KnowledgeGraphView() {
         ctx.fillStyle = hexToRgba(color, nAlpha);
         ctx.fill();
 
-        // Focus ring
-        if (isFocused) {
-          ctx.strokeStyle = "rgba(255,255,255,0.8)";
-          ctx.lineWidth = 2 / cam.scale;
+        // Selected ring (persistent white ring)
+        if (isSelected) {
+          ctx.strokeStyle = "rgba(255,255,255,0.9)";
+          ctx.lineWidth = 2.5 / cam.scale;
           ctx.stroke();
+        } else if (isFocused) {
+          ctx.strokeStyle = "rgba(255,255,255,0.5)";
+          ctx.lineWidth = 1.5 / cam.scale;
+          ctx.stroke();
+        }
+
+        // Type label for selected node's connections (when zoomed enough)
+        if (
+          isSelected &&
+          cam.scale > 0.6
+        ) {
+          ctx.font = `${10 / cam.scale}px Inter, system-ui, sans-serif`;
+          ctx.fillStyle = "rgba(255,255,255,0.7)";
+          ctx.textAlign = "center";
+          ctx.fillText(
+            n.label.slice(0, 30) + (n.label.length > 30 ? "..." : ""),
+            n.x,
+            n.y + r + 14 / cam.scale
+          );
         }
       }
 
       ctx.restore(); // back to screen space
 
-      /* ── Tooltip (screen space) ──────────────────────────────── */
+      /* ── Tooltip (screen space, only when hovering non-selected) ── */
       const tipId = hoveredRef.current;
-      if (tipId) {
+      if (tipId && tipId !== selectedRef.current) {
         const n = nodeMap.get(tipId);
         if (n) {
           const sx = (n.x - cam.x) * cam.scale + w / 2;
@@ -475,19 +585,23 @@ export default function KnowledgeGraphView() {
           ctx.font = "600 11px Inter, system-ui, sans-serif";
           const labelW = ctx.measureText(label).width;
           ctx.font = "9px Inter, system-ui, sans-serif";
-          const typeW = ctx.measureText(typeText + "  " + degreeText).width;
+          const typeW = ctx.measureText(
+            typeText + "  " + degreeText
+          ).width;
           const boxW = Math.max(labelW, typeW) + 24;
           const boxH = 40;
-          const boxX = Math.max(4, Math.min(w - boxW - 4, sx - boxW / 2));
-          const boxY = sy - nodeRadius(n.degree) * cam.scale - boxH - 10;
+          const boxX = Math.max(
+            4,
+            Math.min(w - boxW - 4, sx - boxW / 2)
+          );
+          const boxY =
+            sy - nodeRadius(n.degree) * cam.scale - boxH - 10;
 
-          // Shadow
           ctx.fillStyle = "rgba(0,0,0,0.4)";
           ctx.beginPath();
           ctx.roundRect(boxX + 2, boxY + 2, boxW, boxH, 8);
           ctx.fill();
 
-          // Box
           ctx.fillStyle = "rgba(18,20,26,0.95)";
           ctx.strokeStyle = hexToRgba(color, 0.35);
           ctx.lineWidth = 1;
@@ -496,19 +610,16 @@ export default function KnowledgeGraphView() {
           ctx.fill();
           ctx.stroke();
 
-          // Accent bar on left
           ctx.fillStyle = color;
           ctx.beginPath();
           ctx.roundRect(boxX, boxY, 3, boxH, [8, 0, 0, 8]);
           ctx.fill();
 
-          // Label text
           ctx.font = "600 11px Inter, system-ui, sans-serif";
           ctx.fillStyle = "rgba(255,255,255,0.9)";
           ctx.textAlign = "left";
           ctx.fillText(label, boxX + 12, boxY + 16);
 
-          // Type + degree
           ctx.font = "9px Inter, system-ui, sans-serif";
           ctx.fillStyle = color;
           ctx.fillText(typeText, boxX + 12, boxY + 30);
@@ -570,7 +681,6 @@ export default function KnowledgeGraphView() {
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
 
-      // Panning
       if (panRef.current) {
         didMoveRef.current = true;
         const cam = cameraRef.current;
@@ -580,10 +690,10 @@ export default function KnowledgeGraphView() {
         cam.y =
           panRef.current.camY -
           (sy - panRef.current.startY) / cam.scale;
+        cameraTargetRef.current = null;
         return;
       }
 
-      // Dragging node
       if (dragRef.current) {
         didMoveRef.current = true;
         const { x: wx, y: wy } = screenToWorld(sx, sy);
@@ -595,10 +705,8 @@ export default function KnowledgeGraphView() {
         return;
       }
 
-      // Hover detection
       const node = findNodeAt(sx, sy);
       hoveredRef.current = node?.id ?? null;
-  
       canvas.style.cursor = node ? "pointer" : "grab";
     },
     [findNodeAt, screenToWorld]
@@ -634,8 +742,6 @@ export default function KnowledgeGraphView() {
   const handleMouseUp = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
       const wasDrag = didMoveRef.current;
-      const wasPan = !!panRef.current;
-      const wasNodeDrag = !!dragRef.current;
       dragRef.current = null;
       panRef.current = null;
 
@@ -643,21 +749,23 @@ export default function KnowledgeGraphView() {
       if (!canvas) return;
       canvas.style.cursor = "grab";
 
-      // Click (no significant movement) — toggle selection
+      // Click (no movement) — select/deselect
       if (!wasDrag) {
         const rect = canvas.getBoundingClientRect();
         const sx = e.clientX - rect.left;
         const sy = e.clientY - rect.top;
         const node = findNodeAt(sx, sy);
         if (node) {
-          selectedRef.current =
-            selectedRef.current === node.id ? null : node.id;
-        } else if (!wasPan && !wasNodeDrag) {
-          selectedRef.current = null;
+          // Toggle if same node, otherwise select new
+          selectNode(
+            selectedRef.current === node.id ? null : node.id
+          );
+        } else {
+          selectNode(null);
         }
       }
     },
-    [findNodeAt]
+    [findNodeAt, selectNode]
   );
 
   const handleMouseLeave = useCallback(() => {
@@ -666,6 +774,15 @@ export default function KnowledgeGraphView() {
     hoveredRef.current = null;
   }, []);
 
+  /* ── Navigate to a connection (from detail panel) ───────────── */
+
+  const navigateToNode = useCallback(
+    (nodeId: string) => {
+      selectNode(nodeId);
+    },
+    [selectNode]
+  );
+
   /* ── Render ──────────────────────────────────────────────────── */
 
   return (
@@ -673,11 +790,14 @@ export default function KnowledgeGraphView() {
       {/* Header bar */}
       <div className="flex-shrink-0 p-3 border-b border-brain-border bg-brain-surface/50">
         <div className="flex items-center justify-between">
-          <h2 className="text-white text-sm font-medium">Knowledge Graph</h2>
+          <h2 className="text-white text-sm font-medium">
+            Knowledge Graph
+          </h2>
           <div className="flex items-center gap-2">
             <button
               onClick={() => {
                 cameraRef.current = { x: 0, y: 0, scale: 1 };
+                cameraTargetRef.current = null;
               }}
               className="px-2 py-1 bg-brain-surface text-brain-text/60 text-[10px] rounded-md hover:bg-brain-border hover:text-brain-text transition-colors"
               title="Reset zoom and pan"
@@ -706,8 +826,14 @@ export default function KnowledgeGraphView() {
         {(stats || graphStats) && (
           <div className="flex gap-4 mt-2">
             {[
-              { label: "Nodes", value: (stats || graphStats)!.node_count },
-              { label: "Edges", value: (stats || graphStats)!.edge_count },
+              {
+                label: "Nodes",
+                value: (stats || graphStats)!.node_count,
+              },
+              {
+                label: "Edges",
+                value: (stats || graphStats)!.edge_count,
+              },
               {
                 label: "Clusters",
                 value: (stats || graphStats)!.hyperedge_count,
@@ -740,13 +866,13 @@ export default function KnowledgeGraphView() {
           ))}
         </div>
 
-        {/* Hint */}
         <div className="text-brain-text/25 text-[9px] mt-1">
-          Scroll to zoom · Drag to pan · Hover nodes to explore connections
+          Scroll to zoom · Drag to pan · Click a node to explore
+          its connections
         </div>
       </div>
 
-      {/* Canvas area */}
+      {/* Canvas + detail panel area */}
       <div ref={containerRef} className="flex-1 min-h-0 relative">
         <canvas
           ref={canvasRef}
@@ -756,6 +882,101 @@ export default function KnowledgeGraphView() {
           onMouseLeave={handleMouseLeave}
           className="absolute inset-0 cursor-grab"
         />
+
+        {/* Detail panel — slides in from right when a node is selected */}
+        {selected && (
+          <div className="absolute top-0 right-0 bottom-0 w-[300px] bg-brain-surface/95 backdrop-blur-sm border-l border-brain-border flex flex-col overflow-hidden">
+            {/* Panel header */}
+            <div className="flex-shrink-0 p-3 border-b border-brain-border">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <div
+                    className="w-3 h-3 rounded-full flex-shrink-0"
+                    style={{
+                      backgroundColor: getColor(
+                        selected.node.memoryType
+                      ),
+                    }}
+                  />
+                  <span className="text-[10px] uppercase tracking-wider text-brain-text/50">
+                    {selected.node.memoryType}
+                  </span>
+                </div>
+                <button
+                  onClick={() => selectNode(null)}
+                  className="text-brain-text/40 hover:text-white text-sm transition-colors px-1"
+                  title="Close panel"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="flex gap-3 text-[10px]">
+                <span className="text-brain-text/40">
+                  {selected.node.degree} connection
+                  {selected.node.degree !== 1 ? "s" : ""}
+                </span>
+                <span className="text-brain-text/40">
+                  importance:{" "}
+                  {selected.node.importance.toFixed(2)}
+                </span>
+              </div>
+            </div>
+
+            {/* Content */}
+            <div className="flex-shrink-0 max-h-[40%] overflow-y-auto p-3 border-b border-brain-border">
+              <div className="text-[10px] uppercase tracking-wider text-brain-text/30 mb-1">
+                Content
+              </div>
+              <p className="text-brain-text text-[12px] leading-relaxed whitespace-pre-wrap break-words">
+                {selected.node.content}
+              </p>
+            </div>
+
+            {/* Connections list */}
+            <div className="flex-1 min-h-0 overflow-y-auto">
+              <div className="p-3">
+                <div className="text-[10px] uppercase tracking-wider text-brain-text/30 mb-2">
+                  Connections ({selected.connections.length})
+                </div>
+                {selected.connections.length === 0 ? (
+                  <p className="text-brain-text/30 text-[11px]">
+                    No visible connections
+                  </p>
+                ) : (
+                  <div className="space-y-1">
+                    {selected.connections.map((conn) => (
+                      <button
+                        key={conn.id}
+                        onClick={() => navigateToNode(conn.id)}
+                        className="w-full text-left p-2 rounded-lg hover:bg-brain-bg/60 transition-colors group"
+                      >
+                        <div className="flex items-center gap-2 mb-0.5">
+                          <div
+                            className="w-2 h-2 rounded-full flex-shrink-0"
+                            style={{
+                              backgroundColor: getColor(
+                                conn.memoryType
+                              ),
+                            }}
+                          />
+                          <span className="text-[9px] uppercase tracking-wider text-brain-text/40">
+                            {conn.memoryType}
+                          </span>
+                          <span className="text-[9px] text-brain-text/25 ml-auto">
+                            {conn.degree} conn.
+                          </span>
+                        </div>
+                        <p className="text-brain-text/70 text-[11px] leading-snug line-clamp-2 group-hover:text-brain-text transition-colors">
+                          {conn.label}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
