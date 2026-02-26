@@ -1448,14 +1448,10 @@ pub fn verify_storage(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
     let status = state.vector_store.status();
-    let metrics = state.vector_store.metrics();
     Ok(serde_json::json!({
         "ok": true,
         "total_vectors": status.total_vectors,
         "file_size_bytes": status.file_size,
-        "current_epoch": status.current_epoch,
-        "dead_space_ratio": status.dead_space_ratio,
-        "id_map_count": metrics.id_map_count,
     }))
 }
 
@@ -1544,7 +1540,7 @@ pub async fn verify_all(
 ) -> Result<serde_json::Value, String> {
     // Storage
     let storage_metrics = state.vector_store.metrics();
-    let storage_ok = storage_metrics.dead_space_ratio < 0.5;
+    let storage_ok = true; // redb is always crash-safe
 
     // SONA
     let sona_stats = state.sona.stats();
@@ -1587,9 +1583,7 @@ pub async fn verify_all(
         "storage": {
             "ok": storage_ok,
             "vectors": storage_metrics.total_vectors,
-            "dead_space_ratio": storage_metrics.dead_space_ratio,
             "file_size_bytes": storage_metrics.file_size_bytes,
-            "epoch": storage_metrics.current_epoch,
         },
         "sona": {
             "ok": sona_ok,
@@ -1822,6 +1816,71 @@ pub fn compression_stats(
         "total_memories": stats.total_memories,
         "total_accesses": stats.total_accesses,
     }))
+}
+
+// ---- Knowledge Bootstrap ----
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KnowledgeBootstrapResult {
+    pub total_memories_created: u32,
+    pub total_skipped: u32,
+    pub sources: Vec<crate::indexer::bootstrap::SourceResult>,
+    pub duration_secs: f64,
+}
+
+/// Core implementation shared by Tauri IPC and HTTP API.
+pub async fn bootstrap_knowledge_impl(
+    sources: Vec<String>,
+    state: &AppState,
+    app_handle: Option<&tauri::AppHandle>,
+) -> Result<KnowledgeBootstrapResult, String> {
+    let result = crate::indexer::bootstrap::bootstrap_knowledge(state, app_handle, sources).await?;
+    Ok(KnowledgeBootstrapResult {
+        total_memories_created: result.total_memories_created,
+        total_skipped: result.total_skipped,
+        sources: result.sources,
+        duration_secs: result.duration_secs,
+    })
+}
+
+#[tauri::command]
+pub async fn bootstrap_knowledge(
+    sources: Vec<String>,
+    state: State<'_, Arc<AppState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<KnowledgeBootstrapResult, String> {
+    bootstrap_knowledge_impl(sources, &state, Some(&app_handle)).await
+}
+
+// ---- Browser History Sync ----
+
+/// Trigger a manual browser history sync pass.
+pub async fn browser_sync_impl(state: &AppState) -> Result<u32, String> {
+    state.browser_indexer.sync_pass().await
+}
+
+#[tauri::command]
+pub async fn browser_sync(
+    state: State<'_, Arc<AppState>>,
+) -> Result<u32, String> {
+    browser_sync_impl(&state).await
+}
+
+/// Get browser indexer statistics.
+pub fn browser_stats_impl(state: &AppState) -> Result<serde_json::Value, String> {
+    let stats = state.browser_indexer.stats();
+    Ok(serde_json::json!({
+        "indexed_count": stats.indexed_count,
+        "last_sync_unix": stats.last_sync_unix,
+        "is_syncing": stats.is_syncing,
+    }))
+}
+
+#[tauri::command]
+pub fn browser_stats(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    browser_stats_impl(&state)
 }
 
 // ---- Flush (save to disk) ----

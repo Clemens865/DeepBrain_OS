@@ -3,7 +3,10 @@
 //! Watches filesystem, chunks files, and indexes them with vector embeddings
 //! for semantic file search.
 
+pub mod bootstrap;
+pub mod browser;
 pub mod chunker;
+pub mod claude_listener;
 pub mod email;
 pub mod parser;
 pub mod watcher;
@@ -286,40 +289,14 @@ impl FileIndexer {
         Ok((file_chunks.len() as u32, rvf_batch))
     }
 
-    /// Maximum RVF store size for file indexing (500 MB).
-    /// Beyond this, only re-indexing of already-indexed files is allowed
-    /// (updates existing vectors), but new files are rejected to cap growth.
-    const MAX_STORE_SIZE: u64 = 500 * 1024 * 1024;
-
     /// Index a single file (public API — for individual file updates via watcher).
     ///
-    /// Immediately flushes to RVF. For bulk scans, use `scan_all` which
-    /// accumulates vectors across files for efficient batch writes.
+    /// Immediately flushes to the vector store. For bulk scans, use `scan_all`
+    /// which accumulates vectors across files for efficient batch writes.
     pub async fn index_file(&self, path: &Path) -> Result<u32, String> {
         // Apply the same filtering as the watcher (for callers that bypass it)
         if !watcher::should_index(path) {
             return Ok(0);
-        }
-
-        // Storage budget: skip new files if RVF store exceeds limit.
-        // Allow re-indexing of existing files (just updates vectors in place).
-        if let Some(ref store) = self.vector_store {
-            let metrics = store.metrics();
-            if metrics.file_size_bytes > Self::MAX_STORE_SIZE {
-                // Check if this file is already indexed (update = ok, new = reject)
-                let path_str = path.to_string_lossy().to_string();
-                let conn = self.open_connection()?;
-                let exists: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM file_index WHERE path = ?1",
-                        params![path_str],
-                        |_| Ok(()),
-                    )
-                    .is_ok();
-                if !exists {
-                    return Ok(0); // Silently skip — budget exhausted
-                }
-            }
         }
 
         let (count, rvf_batch) = self.index_file_inner(path).await?;
@@ -379,28 +356,11 @@ impl FileIndexer {
             before_filter - files.len()
         );
 
-        // Accumulate RVF batch entries across files
+        // Accumulate batch entries across files
         let mut rvf_pending: Vec<(String, Vec<f32>, VectorMetadata)> = Vec::new();
         let mut files_since_flush = 0usize;
-        let mut budget_exhausted = false;
 
         for (i, path) in files.iter().enumerate() {
-            // Check storage budget periodically (every 100 files to avoid overhead)
-            if !budget_exhausted && i % 100 == 0 {
-                if let Some(ref store) = self.vector_store {
-                    if store.metrics().file_size_bytes > Self::MAX_STORE_SIZE {
-                        tracing::warn!(
-                            "Storage budget reached ({} MB) — stopping scan at file {}/{}",
-                            Self::MAX_STORE_SIZE / (1024 * 1024), i, files.len()
-                        );
-                        budget_exhausted = true;
-                    }
-                }
-            }
-            if budget_exhausted {
-                break;
-            }
-
             match self.index_file_inner(path).await {
                 Ok((chunks, rvf_batch)) => {
                     total += chunks;

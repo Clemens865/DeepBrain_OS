@@ -69,10 +69,8 @@ ndarray = "0.17.2"
 hnsw_rs = "0.3"
 tauri-plugin-updater = "2.10.0"
 
-# RuVector RVF storage (path deps to local source)
-rvf-runtime = { path = "../../ruvector-main/crates/rvf/rvf-runtime" }
-rvf-types = { path = "../../ruvector-main/crates/rvf/rvf-types", features = ["std"] }
-rvf-crypto = { path = "../../ruvector-main/crates/rvf/rvf-crypto" }
+# RuVector crash-safe vector storage (redb + HNSW)
+ruvector-core = { path = "../../ruvector-main/crates/ruvector-core", features = ["storage", "hnsw"] }
 ruvector-sona = { path = "../../ruvector-main/crates/sona", default-features = false, features = ["serde-support"] }
 ruvector-nervous-system = { path = "../../ruvector-main/crates/ruvector-nervous-system", default-features = false }
 ruvector-graph = { path = "../../ruvector-main/crates/ruvector-graph", default-features = false, features = ["storage"] }

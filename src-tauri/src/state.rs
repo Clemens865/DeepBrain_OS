@@ -23,6 +23,7 @@ use crate::deepbrain::nervous_bridge::NervousBridge;
 use crate::deepbrain::sona_bridge::SonaBridge;
 use crate::deepbrain::vector_store::DeepBrainVectorStore;
 use crate::indexer::FileIndexer;
+use crate::indexer::browser::BrowserIndexer;
 use crate::indexer::email::EmailIndexer;
 
 /// Application settings
@@ -116,6 +117,7 @@ pub struct AppState {
     pub persistence: Arc<BrainPersistence>,
     pub indexer: Arc<FileIndexer>,
     pub email_indexer: Arc<EmailIndexer>,
+    pub browser_indexer: Arc<BrowserIndexer>,
     pub context: Arc<ContextManager>,
     pub sona: Arc<SonaBridge>,
     pub nervous: Arc<NervousBridge>,
@@ -136,7 +138,7 @@ impl AppState {
         let persistence = BrainPersistence::new()?;
         let embeddings = EmbeddingModel::new();
 
-        // --- Initialize DeepBrain RVF vector store ---
+        // --- Initialize DeepBrain vector store (ruvector-core / redb) ---
         let data_dir = dirs::data_dir()
             .ok_or("No data dir")?
             .join("DeepBrain");
@@ -192,7 +194,7 @@ impl AppState {
         // Create tensor compression bridge
         let compressor = Arc::new(CompressBridge::new());
 
-        // Create cognitive engine with RVF-backed memory + SONA + nervous system
+        // Create cognitive engine with vector-store-backed memory + SONA + nervous system
         let engine = CognitiveEngine::with_all(
             Some(CognitiveConfig::default()),
             Arc::clone(&vector_store),
@@ -200,13 +202,11 @@ impl AppState {
             Arc::clone(&nervous),
         );
 
-        // Restore persisted memories (metadata into DashMap, vectors already in RVF)
+        // Restore persisted memories (batch insert into vector store + DashMap)
         match persistence.load_memories() {
             Ok(memories) => {
                 let count = memories.len();
-                for node in memories {
-                    engine.memory.restore_node(node);
-                }
+                engine.memory.restore_nodes_batch(memories);
                 if count > 0 {
                     tracing::info!("Restored {} memories from database", count);
                 }
@@ -250,8 +250,18 @@ impl AppState {
             tracing::info!("Loaded Claude API key from Keychain");
         }
         if let Ok(Some(token)) = crate::keychain::get_secret("api_token") {
-            settings.api_token = Some(token);
+            settings.api_token = Some(token.clone());
             tracing::info!("Loaded API token from Keychain");
+            // Sync token file so external tools (MCP servers, CLI) can read it
+            let token_file = data_dir.join(".api_token");
+            if let Err(e) = std::fs::write(&token_file, &token) {
+                tracing::warn!("Failed to sync API token file: {}", e);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600));
+            }
         }
 
         // Ensure we always have an API token in settings (generate if Keychain was empty)
@@ -280,8 +290,10 @@ impl AppState {
         engine.set_running(true);
 
         let embeddings = Arc::new(embeddings);
+        let engine = Arc::new(engine);
+        let persistence = Arc::new(persistence);
 
-        // Initialize file indexer with shared RVF vector store
+        // Initialize file indexer with shared vector store
         let index_db = dirs::data_dir()
             .ok_or("No data dir")?
             .join("DeepBrain")
@@ -292,12 +304,21 @@ impl AppState {
             Arc::clone(&vector_store),
         )?;
 
-        // Initialize email indexer with shared RVF vector store
+        // Initialize email indexer with shared vector store
         let email_indexer = EmailIndexer::with_vector_store(
             index_db,
             embeddings.clone(),
             Arc::clone(&vector_store),
         )?;
+
+        // Initialize browser history indexer
+        let browser_indexer = Arc::new(BrowserIndexer::new(
+            Arc::clone(&engine),
+            embeddings.clone(),
+            Some(Arc::clone(&vector_store)),
+            Arc::clone(&persistence),
+            Arc::clone(&graph),
+        ));
 
         // Configure email account filter from settings
         if !settings.email_accounts.is_empty() {
@@ -318,19 +339,18 @@ impl AppState {
 
         let ai_provider = Self::build_ai_provider(&settings);
 
-        let persistence = Arc::new(persistence);
-
         let indexer = Arc::new(indexer);
 
-        // No HNSW index build needed — RvfStore boots from its own manifest.
-        tracing::info!("File indexer ready (RVF-backed)");
+        // HNSW index is rebuilt from redb on VectorDB::new().
+        tracing::info!("File indexer ready (VectorDB-backed)");
 
         Ok(Self {
-            engine: Arc::new(engine),
+            engine,
             embeddings,
             persistence,
             indexer,
             email_indexer: Arc::new(email_indexer),
+            browser_indexer,
             context: Arc::new(ContextManager::new()),
             sona,
             nervous,

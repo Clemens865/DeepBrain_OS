@@ -44,7 +44,7 @@ pub struct NativeMemory {
     type_indices: DashMap<String, Vec<String>, ahash::RandomState>,
     /// Vector dimension
     dimensions: usize,
-    /// RVF-backed vector store for crash-safe, indexed search.
+    /// Vector store for crash-safe, indexed search.
     /// None = brute-force fallback (tests or when store not yet initialized).
     vector_store: Option<Arc<DeepBrainVectorStore>>,
     /// Configuration
@@ -89,7 +89,7 @@ impl NativeMemory {
         }
     }
 
-    /// Create a new native memory system backed by a DeepBrain RVF vector store.
+    /// Create a new native memory system backed by a DeepBrain vector store.
     pub fn with_vector_store(dimensions: u32, store: Arc<DeepBrainVectorStore>) -> Self {
         Self {
             memories: DashMap::with_hasher(ahash::RandomState::new()),
@@ -150,6 +150,79 @@ impl NativeMemory {
         Ok(id)
     }
 
+    /// Check if a memory with the given ID exists.
+    pub fn has_memory(&self, id: &str) -> bool {
+        self.memories.contains_key(id)
+    }
+
+    /// Store a memory with a caller-provided ID and pre-computed f32 vector.
+    ///
+    /// Used by bootstrap importers for deterministic/idempotent IDs.
+    /// If a memory with this ID already exists, it is skipped (returns Ok(false)).
+    pub fn store_f32_with_id(
+        &self,
+        id: String,
+        content: String,
+        mut vector: Vec<f32>,
+        memory_type: String,
+        importance: f64,
+    ) -> Result<bool, String> {
+        if vector.len() != self.dimensions {
+            return Err(format!(
+                "Vector dimension mismatch: expected {}, got {}",
+                self.dimensions,
+                vector.len()
+            ));
+        }
+
+        // Idempotency: skip if already exists
+        if self.memories.contains_key(&id) {
+            return Ok(false);
+        }
+
+        normalize_vector(&mut vector);
+
+        let mem_type = parse_memory_type(&memory_type);
+
+        // Insert into vector store if available.
+        if let Some(ref store) = self.vector_store {
+            let meta = VectorMetadata {
+                source: "memory".to_string(),
+                memory_type: memory_type.clone(),
+                importance,
+                timestamp: now_millis(),
+                ..Default::default()
+            };
+            if let Err(e) = store.store_vector(&id, &vector, meta) {
+                tracing::warn!("Failed to store vector: {}", e);
+            }
+        }
+
+        let node = MemoryNode {
+            id: id.clone(),
+            content,
+            vector,
+            memory_type: mem_type,
+            importance,
+            decay: 0.0,
+            access_count: 0,
+            timestamp: now_millis(),
+            connections: SmallVec::new(),
+        };
+
+        self.memories.insert(id.clone(), node);
+
+        self.type_indices
+            .entry(memory_type)
+            .or_insert_with(Vec::new)
+            .push(id);
+
+        self.total_stores.fetch_add(1, Ordering::Relaxed);
+        self.enforce_limits();
+
+        Ok(true)
+    }
+
     /// Store a memory with a pre-computed f32 vector (no conversion needed)
     pub fn store_f32(
         &self,
@@ -171,7 +244,7 @@ impl NativeMemory {
         let id = generate_id();
         let mem_type = parse_memory_type(&memory_type);
 
-        // Insert into RVF vector store if available.
+        // Insert into vector store if available.
         if let Some(ref store) = self.vector_store {
             let meta = VectorMetadata {
                 source: "memory".to_string(),
@@ -181,7 +254,7 @@ impl NativeMemory {
                 ..Default::default()
             };
             if let Err(e) = store.store_vector(&id, &vector, meta) {
-                tracing::warn!("Failed to store vector in RVF: {}", e);
+                tracing::warn!("Failed to store vector: {}", e);
             }
         }
 
@@ -329,7 +402,7 @@ impl NativeMemory {
     }
 
     /// Search with f32 query (no conversion needed).
-    /// Uses HNSW index for O(log n) search when available, falls back to brute force.
+    /// Uses HNSW index via vector store for O(log n) search when available, falls back to brute force.
     pub fn search_f32(
         &self,
         query: &[f32],
@@ -345,10 +418,10 @@ impl NativeMemory {
         let type_filter: Option<Vec<MemoryType>> = memory_types
             .map(|types| types.iter().map(|t| parse_memory_type(t)).collect());
 
-        // Try RVF vector store first (fast O(log n) HNSW)
+        // Try vector store first (fast O(log n) HNSW)
         if let Some(ref store) = self.vector_store {
             if self.memories.len() > 10 {
-                return self.search_f32_rvf(store, query, k, type_filter.as_ref(), min_sim);
+                return self.search_f32_indexed(store, query, k, type_filter.as_ref(), min_sim);
             }
         }
 
@@ -417,8 +490,8 @@ impl NativeMemory {
         Ok(top_k)
     }
 
-    /// RVF vector store accelerated search with post-filtering for decay/type.
-    fn search_f32_rvf(
+    /// Vector store accelerated search with post-filtering for decay/type.
+    fn search_f32_indexed(
         &self,
         store: &DeepBrainVectorStore,
         query: &[f32],
@@ -427,7 +500,7 @@ impl NativeMemory {
         min_sim: f32,
     ) -> Result<Vec<SearchResult>, String> {
         // Build filter for source=memory. Type filtering is done post-search
-        // against the DashMap since RVF metadata filtering is coarser.
+        // against the DashMap since metadata filtering is coarser.
         let filter = Some(VectorFilter::Source("memory".to_string()));
 
         // Over-fetch to account for type filtering and decay adjustments.
@@ -439,7 +512,7 @@ impl NativeMemory {
 
         let rvf_results = store
             .search(query, fetch_k, filter)
-            .map_err(|e| format!("RVF search failed: {}", e))?;
+            .map_err(|e| format!("Vector search failed: {}", e))?;
 
         let mut results: Vec<SearchResult> = rvf_results
             .into_iter()
@@ -454,7 +527,7 @@ impl NativeMemory {
                     }
                 }
 
-                // Apply decay adjustment to RVF similarity score.
+                // Apply decay adjustment to similarity score.
                 let adjusted_sim = vr.similarity as f32 * (1.0 - node.decay as f32);
 
                 if adjusted_sim < min_sim {
@@ -528,10 +601,10 @@ impl NativeMemory {
             .collect();
 
         for id in to_prune {
-            // Delete from RVF vector store.
+            // Delete from vector store.
             if let Some(ref store) = self.vector_store {
                 if let Err(e) = store.delete(&id) {
-                    tracing::warn!("Failed to delete vector from RVF during consolidation: {}", e);
+                    tracing::warn!("Failed to delete vector during consolidation: {}", e);
                 }
             }
             self.memories.remove(&id);
@@ -571,7 +644,7 @@ impl NativeMemory {
     pub fn delete(&self, id: &str) -> bool {
         if let Some(ref store) = self.vector_store {
             if let Err(e) = store.delete(id) {
-                tracing::warn!("Failed to delete vector from RVF: {}", e);
+                tracing::warn!("Failed to delete vector: {}", e);
             }
         }
         self.memories.remove(id).is_some()
@@ -608,13 +681,13 @@ impl NativeMemory {
 
     /// Restore a memory node (for persistence loading).
     ///
-    /// When a vector_store is present, this inserts the vector into RVF.
+    /// When a vector_store is present, this inserts the vector into the store.
     /// The DashMap is always populated for fast metadata lookups.
     pub fn restore_node(&self, node: MemoryNode) {
         let type_str = format!("{:?}", node.memory_type);
         let id = node.id.clone();
 
-        // Insert into RVF vector store if available.
+        // Insert into vector store if available.
         if let Some(ref store) = self.vector_store {
             let meta = VectorMetadata {
                 source: "memory".to_string(),
@@ -624,7 +697,7 @@ impl NativeMemory {
                 ..Default::default()
             };
             if let Err(e) = store.store_vector(&id, &node.vector, meta) {
-                tracing::warn!("Failed to restore vector into RVF: {}", e);
+                tracing::warn!("Failed to restore vector into store: {}", e);
             }
         }
 
@@ -633,6 +706,56 @@ impl NativeMemory {
             .entry(type_str)
             .or_insert_with(Vec::new)
             .push(id);
+    }
+
+    /// Restore all memory nodes in a single batch insert.
+    ///
+    /// This is the critical performance path: instead of 3,500 individual
+    /// store_vector calls (one epoch each in RVF), we do ONE batch insert.
+    /// DashMap and type_indices are populated for all nodes.
+    pub fn restore_nodes_batch(&self, nodes: Vec<MemoryNode>) {
+        if nodes.is_empty() {
+            return;
+        }
+
+        // Build batch for vector store
+        if let Some(ref store) = self.vector_store {
+            let batch: Vec<(String, Vec<f32>, VectorMetadata)> = nodes
+                .iter()
+                .map(|node| {
+                    let type_str = format!("{:?}", node.memory_type);
+                    let meta = VectorMetadata {
+                        source: "memory".to_string(),
+                        memory_type: type_str,
+                        importance: node.importance,
+                        timestamp: node.timestamp,
+                        ..Default::default()
+                    };
+                    (node.id.clone(), node.vector.clone(), meta)
+                })
+                .collect();
+
+            tracing::info!("Restoring {} memories in batch...", batch.len());
+            match store.store_batch(&batch) {
+                Ok(accepted) => {
+                    tracing::info!("Batch restore accepted {} vectors", accepted);
+                }
+                Err(e) => {
+                    tracing::error!("Batch restore failed: {}", e);
+                }
+            }
+        }
+
+        // Populate DashMap and type indices for all nodes
+        for node in nodes {
+            let type_str = format!("{:?}", node.memory_type);
+            let id = node.id.clone();
+            self.memories.insert(id.clone(), node);
+            self.type_indices
+                .entry(type_str)
+                .or_insert_with(Vec::new)
+                .push(id);
+        }
     }
 
     /// Get statistics

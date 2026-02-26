@@ -239,6 +239,13 @@ return frontApp & "\n" & frontWindow"#,
             extract_file_path(&effective_title)
         };
 
+        // Capture browser URL when Comet is frontmost
+        let url = if !is_excluded && app_name == "Comet" {
+            get_browser_url(&app_name).await
+        } else {
+            None
+        };
+
         let event = ActivityEvent {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_millis(),
@@ -246,7 +253,7 @@ return frontApp & "\n" & frontWindow"#,
             app_name: Some(app_name),
             window_title: Some(effective_title),
             file_path,
-            url: None,
+            url,
             content_preview: None,
             metadata: None,
             project,
@@ -586,6 +593,30 @@ pub fn detect_project_from_path(path_str: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Fetch the current URL from a Chromium-based browser via AppleScript.
+async fn get_browser_url(app_name: &str) -> Option<String> {
+    let script = match app_name {
+        "Comet" => r#"tell application "Comet" to return URL of active tab of window 1"#,
+        _ => return None,
+    };
+    let output = tokio::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .await
+        .ok()?;
+    if output.status.success() {
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if url.starts_with("http") {
+            Some(url)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
 /// Extract a file path from a window title if one is present.

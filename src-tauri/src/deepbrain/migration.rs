@@ -1,7 +1,7 @@
-//! SQLite → RvfStore migration tool.
+//! SQLite → VectorDB migration tool.
 //!
 //! Migrates vectors from SuperBrain's brain.db (memories) and files.db
-//! (file_chunks, including email chunks) into the DeepBrain RvfStore.
+//! (file_chunks, including email chunks) into the DeepBrain VectorDB.
 //!
 //! Migration is non-destructive — the source SQLite databases are only read.
 
@@ -31,7 +31,7 @@ pub struct MigrationReport {
     pub verified: bool,
 }
 
-/// Migrate vectors from SuperBrain SQLite databases to a DeepBrain RvfStore.
+/// Migrate vectors from SuperBrain SQLite databases to a DeepBrain VectorDB.
 ///
 /// # Arguments
 /// * `brain_db` - Path to SuperBrain's brain.db (contains `memories` table)
@@ -57,12 +57,14 @@ pub fn migrate_from_superbrain(
 
     // --- Phase 1: Migrate memory vectors from brain.db ---
     if brain_db.exists() {
-        let conn = Connection::open(brain_db)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let conn = Connection::open(brain_db)
+            .map_err(|e| DeepBrainError::Migration(format!("Failed to open brain.db: {}", e)))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(|e| DeepBrainError::Migration(format!("PRAGMA failed: {}", e)))?;
 
         let mut stmt = conn.prepare(
             "SELECT id, vector, memory_type, importance, timestamp FROM memories",
-        )?;
+        ).map_err(|e| DeepBrainError::Migration(format!("Prepare failed: {}", e)))?;
 
         let mut batch: Vec<(String, Vec<f32>, VectorMetadata)> = Vec::with_capacity(500);
 
@@ -73,10 +75,11 @@ pub fn migrate_from_superbrain(
             let importance: f64 = row.get(3)?;
             let timestamp: i64 = row.get(4)?;
             Ok((id, vector_bytes, memory_type, importance, timestamp))
-        })?;
+        }).map_err(|e| DeepBrainError::Migration(format!("Query failed: {}", e)))?;
 
         for row in rows {
-            let (id, vector_bytes, memory_type, importance, timestamp) = row?;
+            let (id, vector_bytes, memory_type, importance, timestamp) = row
+                .map_err(|e| DeepBrainError::Migration(format!("Row read failed: {}", e)))?;
             let vector = bytes_to_f32_vec(&vector_bytes);
 
             if vector.len() != dimension {
@@ -113,12 +116,14 @@ pub fn migrate_from_superbrain(
 
     // --- Phase 2: Migrate file/email chunk vectors from files.db ---
     if files_db.exists() {
-        let conn = Connection::open(files_db)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let conn = Connection::open(files_db)
+            .map_err(|e| DeepBrainError::Migration(format!("Failed to open files.db: {}", e)))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(|e| DeepBrainError::Migration(format!("PRAGMA failed: {}", e)))?;
 
         let mut stmt = conn.prepare(
             "SELECT file_path, chunk_index, vector FROM file_chunks",
-        )?;
+        ).map_err(|e| DeepBrainError::Migration(format!("Prepare failed: {}", e)))?;
 
         let mut batch: Vec<(String, Vec<f32>, VectorMetadata)> = Vec::with_capacity(500);
 
@@ -127,10 +132,11 @@ pub fn migrate_from_superbrain(
             let chunk_index: u32 = row.get(1)?;
             let vector_bytes: Vec<u8> = row.get(2)?;
             Ok((file_path, chunk_index, vector_bytes))
-        })?;
+        }).map_err(|e| DeepBrainError::Migration(format!("Query failed: {}", e)))?;
 
         for row in rows {
-            let (file_path, chunk_index, vector_bytes) = row?;
+            let (file_path, chunk_index, vector_bytes) = row
+                .map_err(|e| DeepBrainError::Migration(format!("Row read failed: {}", e)))?;
             let vector = bytes_to_f32_vec(&vector_bytes);
 
             if vector.len() != dimension {
@@ -235,7 +241,7 @@ pub fn needs_migration(data_dir: &Path) -> bool {
         .unwrap_or_default();
 
     let brain_db = superbrain_dir.join("brain.db");
-    let deepbrain_store = data_dir.join("knowledge.rvtext");
+    let deepbrain_store = data_dir.join("knowledge.redb");
 
     brain_db.exists() && !deepbrain_store.exists()
 }

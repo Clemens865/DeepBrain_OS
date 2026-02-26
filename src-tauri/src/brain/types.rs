@@ -133,6 +133,7 @@ pub struct CognitiveStats {
 
 pub fn parse_memory_type(s: &str) -> MemoryType {
     match s.to_lowercase().as_str() {
+        // Canonical names
         "episodic" => MemoryType::Episodic,
         "semantic" => MemoryType::Semantic,
         "procedural" => MemoryType::Procedural,
@@ -141,6 +142,15 @@ pub fn parse_memory_type(s: &str) -> MemoryType {
         "causal" => MemoryType::Causal,
         "goal" => MemoryType::Goal,
         "emotional" => MemoryType::Emotional,
+        // Aliases — backward compat with old bootstrap labels + natural language
+        "document" | "fact" | "reference" | "info" | "bookmark" | "knowledge" => MemoryType::Semantic,
+        "conversation" | "event" | "experience" | "message" | "query_history" => MemoryType::Episodic,
+        "howto" | "how-to" | "steps" | "process" | "notebook" | "tutorial" => MemoryType::Procedural,
+        "preference" | "feeling" | "sentiment" | "like" | "dislike" => MemoryType::Emotional,
+        "plan" | "intention" | "objective" | "target" | "want" => MemoryType::Goal,
+        "cause" | "effect" | "because" | "reason" | "leads-to" => MemoryType::Causal,
+        "insight" | "pattern" | "reflection" | "about-me" => MemoryType::Meta,
+        "temp" | "scratch" | "context" | "active" => MemoryType::Working,
         _ => MemoryType::Semantic,
     }
 }

@@ -60,16 +60,60 @@ export default function DashboardView() {
     loadModel,
     unloadModel,
     bootstrapSona,
+    bootstrapKnowledge,
+    bootstrapRunning,
+    bootstrapProgress,
+    bootstrapResult,
   } = useAppStore();
 
   const [modelInput, setModelInput] = useState("");
   const [bootstrapping, setBootstrapping] = useState(false);
+  const [selectedSources, setSelectedSources] = useState<Set<string>>(
+    new Set(["file_index", "claude_code", "claude_memory", "whatsapp", "browser", "deepnote"])
+  );
 
   const handleBootstrap = useCallback(async () => {
     setBootstrapping(true);
     await bootstrapSona();
     setBootstrapping(false);
   }, [bootstrapSona]);
+
+  const toggleSource = useCallback((source: string) => {
+    setSelectedSources(prev => {
+      const next = new Set(prev);
+      if (next.has(source)) next.delete(source);
+      else next.add(source);
+      return next;
+    });
+  }, []);
+
+  const handleBootstrapKnowledge = useCallback(async () => {
+    if (selectedSources.size === 0) return;
+    await bootstrapKnowledge(Array.from(selectedSources));
+  }, [bootstrapKnowledge, selectedSources]);
+
+  // Listen for bootstrap progress events from Tauri
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        const fn = await listen<{
+          source: string;
+          phase: string;
+          current: number;
+          total: number;
+          memories_created: number;
+        }>("bootstrap-progress", (event) => {
+          useAppStore.setState({ bootstrapProgress: event.payload });
+        });
+        unlisten = fn;
+      } catch {
+        // Not in Tauri context
+      }
+    })();
+    return () => { unlisten?.(); };
+  }, []);
 
   // Load data on mount and auto-refresh every 10s
   useEffect(() => {
@@ -104,24 +148,120 @@ export default function DashboardView() {
         </div>
       )}
 
+      {/* Knowledge Bootstrap */}
+      <div className="bg-brain-surface rounded-xl p-4 border border-brain-border">
+        <h3 className="text-white text-xs font-medium mb-3">Bootstrap Knowledge</h3>
+        <div className="grid grid-cols-3 gap-2 mb-3">
+          {[
+            { id: "file_index", label: "Documents", desc: "md, pdf, txt, html..." },
+            { id: "claude_code", label: "Claude Code", desc: "Conversations" },
+            { id: "claude_memory", label: "Claude Memory", desc: "MEMORY.md files" },
+            { id: "claude_plans", label: "Claude Plans", desc: "Implementation plans" },
+            { id: "claude_desktop", label: "Claude Desktop", desc: "Agent sessions" },
+            { id: "claude_history", label: "Claude History", desc: "Session prompts" },
+            { id: "whatsapp", label: "WhatsApp", desc: "Chat messages" },
+            { id: "browser", label: "Browser", desc: "Comet history" },
+            { id: "deepnote", label: "Deepnote", desc: "AI notebooks" },
+          ].map(({ id, label, desc }) => (
+            <button
+              key={id}
+              onClick={() => toggleSource(id)}
+              disabled={bootstrapRunning}
+              className={`flex flex-col items-start px-3 py-2 rounded-lg border text-left transition-colors ${
+                selectedSources.has(id)
+                  ? "border-brain-accent bg-brain-accent/10 text-brain-accent"
+                  : "border-brain-border bg-brain-bg/50 text-brain-text/40"
+              } disabled:opacity-50`}
+            >
+              <span className="text-[11px] font-medium">{label}</span>
+              <span className="text-[9px] opacity-60">{desc}</span>
+            </button>
+          ))}
+        </div>
+
+        {bootstrapProgress && (
+          <div className="mb-3">
+            <div className="flex justify-between text-[10px] mb-1">
+              <span className="text-brain-text/60">
+                {bootstrapProgress.source}: {bootstrapProgress.phase}
+              </span>
+              <span className="text-brain-text/40">
+                {bootstrapProgress.current}/{bootstrapProgress.total}
+              </span>
+            </div>
+            <div className="h-1.5 bg-brain-bg rounded-full overflow-hidden">
+              <div
+                className="h-full bg-brain-accent rounded-full transition-all duration-300"
+                style={{
+                  width: `${bootstrapProgress.total > 0 ? (bootstrapProgress.current / bootstrapProgress.total) * 100 : 0}%`,
+                }}
+              />
+            </div>
+            <div className="text-brain-text/30 text-[9px] mt-1">
+              {bootstrapProgress.memories_created} memories created so far
+            </div>
+          </div>
+        )}
+
+        {bootstrapResult && !bootstrapRunning && (
+          <div className="mb-3 bg-brain-bg/50 rounded-lg p-3">
+            <div className="text-brain-success text-[11px] font-medium mb-1">
+              Bootstrap Complete
+            </div>
+            <div className="grid grid-cols-3 gap-2 text-[10px]">
+              <div>
+                <span className="text-brain-text/40">Created:</span>{" "}
+                <span className="text-white">{bootstrapResult.total_memories_created}</span>
+              </div>
+              <div>
+                <span className="text-brain-text/40">Skipped:</span>{" "}
+                <span className="text-white">{bootstrapResult.total_skipped}</span>
+              </div>
+              <div>
+                <span className="text-brain-text/40">Duration:</span>{" "}
+                <span className="text-white">{bootstrapResult.duration_secs.toFixed(1)}s</span>
+              </div>
+            </div>
+            {bootstrapResult.sources.length > 0 && (
+              <div className="mt-2 space-y-1">
+                {bootstrapResult.sources.map((s) => (
+                  <div key={s.source} className="flex items-center gap-2 text-[10px]">
+                    <Dot ok={s.errors === 0} />
+                    <span className="text-brain-text/60">{s.source}</span>
+                    <span className="text-brain-text/30 ml-auto">
+                      +{s.memories_created} / ~{s.skipped_existing}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <button
+          onClick={handleBootstrapKnowledge}
+          disabled={bootstrapRunning || selectedSources.size === 0}
+          className="w-full px-3 py-2 bg-brain-accent/20 text-brain-accent text-[11px] rounded-lg hover:bg-brain-accent/30 transition-colors disabled:opacity-50"
+        >
+          {bootstrapRunning
+            ? "Bootstrapping..."
+            : `Bootstrap ${selectedSources.size === 9 ? "All Sources" : `${selectedSources.size} Source${selectedSources.size !== 1 ? "s" : ""}`}`}
+        </button>
+      </div>
+
       {/* Subsystem Grid */}
       <div className="grid grid-cols-2 gap-3">
         {/* Storage Panel */}
-        <Panel title="RVF Storage">
+        <Panel title="Vector Storage">
           {storageMetrics ? (
             <div className="space-y-2">
               <div className="grid grid-cols-2 gap-2">
                 <Stat label="Vectors" value={storageMetrics.total_vectors} />
                 <Stat label="File Size" value={formatBytes(storageMetrics.file_size_bytes)} />
-                <Stat label="Epoch" value={storageMetrics.current_epoch} />
-                <Stat label="Dead Space" value={`${(storageMetrics.dead_space_ratio * 100).toFixed(1)}%`} />
               </div>
               <div className="border-t border-brain-border/50 pt-2 mt-2">
                 <div className="text-brain-text/30 text-[10px]">
                   Query latency: p50 {formatUs(storageMetrics.query_latency_p50_us)} / p99 {formatUs(storageMetrics.query_latency_p99_us)}
-                </div>
-                <div className="text-brain-text/30 text-[10px]">
-                  ID map: {storageMetrics.id_map_count} entries
                 </div>
               </div>
             </div>

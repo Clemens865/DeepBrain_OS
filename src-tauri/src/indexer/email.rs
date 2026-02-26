@@ -173,22 +173,43 @@ impl EmailIndexer {
     /// Fetch read emails from Apple Mail in a single small batch.
     /// Uses a per-account, per-mailbox approach with strict limits
     /// and a timeout to prevent AppleScript hangs.
+    ///
+    /// Iterates newest-first so recently arrived emails are always captured,
+    /// even when older emails have already been indexed.
     async fn fetch_read_emails(&self, batch_size: u32) -> Result<Vec<IndexedEmail>, String> {
-        // Build account filter for AppleScript
+        // Build account filter for AppleScript.
+        // Match against both account display name AND email addresses so the
+        // user can configure either "Hotmail" or "clemens@hotmail.com".
         let allowed = self.allowed_accounts.read().clone();
         let account_filter = if allowed.is_empty() {
-            // No filter — scan all accounts
             String::new()
         } else {
-            // Build AppleScript list: {"account1", "account2"}
-            let items: Vec<String> = allowed.iter().map(|a| format!("\"{}\"", a)).collect();
+            let items: Vec<String> = allowed.iter().map(|a| format!("\"{}\"", a.to_lowercase())).collect();
             format!("set allowedAccounts to {{{}}}", items.join(", "))
         };
+        // When accounts are specified, build a check block that matches the
+        // account display name OR any of its email addresses.
         let account_check = if allowed.is_empty() {
             String::new()
         } else {
-            // Skip accounts not in the allowed list
-            "if allowedAccounts does not contain acctName then\n      -- skip this account\n    else".to_string()
+            r#"set acctMatch to false
+    set acctNameLower to do shell script "echo " & quoted form of acctName & " | tr '[:upper:]' '[:lower:]'"
+    if allowedAccounts contains acctNameLower then
+      set acctMatch to true
+    else
+      try
+        repeat with ea in email addresses of acct
+          set eaLower to do shell script "echo " & quoted form of (address of ea) & " | tr '[:upper:]' '[:lower:]'"
+          if allowedAccounts contains eaLower then
+            set acctMatch to true
+            exit repeat
+          end if
+        end repeat
+      end try
+    end if
+    if acctMatch is false then
+      -- skip this account
+    else"#.to_string()
         };
         let account_check_end = if allowed.is_empty() {
             String::new()
@@ -199,6 +220,9 @@ impl EmailIndexer {
         // AppleScript: iterate accounts → inbox mailbox of each account, get read messages.
         // Only scans inbox-like mailboxes (INBOX, Posteingang) for performance —
         // scanning all mailboxes takes 3+ minutes due to Mail.app's AppleScript overhead.
+        //
+        // Iterates from msgCount down to 1 (newest first) so new emails are
+        // always picked up even when older ones are already indexed.
         let script = format!(
             r#"tell application "Mail"
   set output to ""
@@ -216,9 +240,7 @@ impl EmailIndexer {
           set msgs to (messages of mbox whose read status is true and date received > (current date) - 30 * days)
           set msgCount to count of msgs
           if msgCount > 0 then
-            set endIdx to msgCount
-            if endIdx > maxResults then set endIdx to maxResults
-            repeat with i from 1 to endIdx
+            repeat with i from msgCount to 1 by -1
               if resultCount >= maxResults then exit repeat
               set m to item i of msgs
               set subj to subject of m

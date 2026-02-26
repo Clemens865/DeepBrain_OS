@@ -159,6 +159,26 @@ pub fn run() {
                 }
             }
 
+            // Start Claude conversation listener (watches for new conversations)
+            {
+                let listener_state = app.state::<Arc<AppState>>().inner().clone();
+                let listener_handle = app.handle().clone();
+                match indexer::claude_listener::start_claude_listener(
+                    listener_state,
+                    listener_handle,
+                ) {
+                    Ok(_watcher) => {
+                        // Leak the watcher to keep it alive for the app lifetime.
+                        // It will be cleaned up when the process exits.
+                        std::mem::forget(_watcher);
+                        tracing::info!("Claude conversation listener started");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to start Claude listener: {}", e);
+                    }
+                }
+            }
+
             // Start background cognitive cycle task (battery-aware)
             let engine = app
                 .state::<Arc<AppState>>()
@@ -168,15 +188,7 @@ pub fn run() {
                 .state::<Arc<AppState>>()
                 .persistence
                 .clone();
-            let vector_store = app
-                .state::<Arc<AppState>>()
-                .vector_store
-                .clone();
             let cycle_handle = app.handle().clone();
-            let rvtext_path = dirs::data_dir()
-                .expect("No data dir")
-                .join("DeepBrain")
-                .join("knowledge.rvtext");
 
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -199,37 +211,6 @@ pub fn run() {
                     let nodes = engine.memory.all_nodes();
                     let _ = persistence.store_memories_batch(&nodes);
                     tracing::debug!("Background cycle completed (battery={})", on_battery);
-
-                    // Auto-compaction: reclaim dead space when ratio exceeds 30%
-                    let metrics = vector_store.metrics();
-                    if metrics.dead_space_ratio > 0.3 {
-                        match vector_store.compact() {
-                            Ok(bytes) => tracing::info!("Auto-compaction reclaimed {} bytes", bytes),
-                            Err(e) => tracing::warn!("Auto-compaction failed: {}", e),
-                        }
-                    }
-
-                    // File size watchdog: force compaction if .rvtext exceeds 2 GB
-                    if let Ok(meta) = std::fs::metadata(&rvtext_path) {
-                        let size_gb = meta.len() as f64 / (1024.0 * 1024.0 * 1024.0);
-                        if size_gb > 2.0 {
-                            tracing::warn!("knowledge.rvtext is {:.1} GB — forcing compaction", size_gb);
-                            match vector_store.compact() {
-                                Ok(bytes) => tracing::info!("Emergency compaction reclaimed {} bytes", bytes),
-                                Err(e) => tracing::error!("Emergency compaction failed: {}", e),
-                            }
-                            // Check if still over limit after compaction
-                            if let Ok(meta) = std::fs::metadata(&rvtext_path) {
-                                let size_gb = meta.len() as f64 / (1024.0 * 1024.0 * 1024.0);
-                                if size_gb > 2.0 {
-                                    tracing::error!(
-                                        "knowledge.rvtext still {:.1} GB after compaction — manual intervention needed",
-                                        size_gb
-                                    );
-                                }
-                            }
-                        }
-                    }
 
                     tray::set_status(&cycle_handle, tray::TrayStatus::Idle);
                 }
@@ -307,6 +288,39 @@ pub fn run() {
                         tokio::time::Duration::from_secs(900)
                     } else {
                         tokio::time::Duration::from_secs(300)
+                    };
+                    tokio::time::sleep(delay).await;
+                }
+            });
+
+            // Start background browser history sync (battery-aware)
+            let browser_indexer = app
+                .state::<Arc<AppState>>()
+                .browser_indexer
+                .clone();
+
+            tauri::async_runtime::spawn(async move {
+                // Wait 60s before first pass to let the app fully settle
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                tracing::info!("Browser history sync background task started");
+
+                loop {
+                    match browser_indexer.sync_pass().await {
+                        Ok(n) if n > 0 => {
+                            tracing::info!("Browser sync: {} new URLs indexed", n);
+                        }
+                        Err(e) => {
+                            tracing::debug!("Browser sync error: {}", e);
+                        }
+                        _ => {}
+                    }
+
+                    // On battery: sync every 30 min; plugged in: every 10 min
+                    let on_battery = is_on_battery();
+                    let delay = if on_battery {
+                        tokio::time::Duration::from_secs(1800)
+                    } else {
+                        tokio::time::Duration::from_secs(600)
                     };
                     tokio::time::sleep(delay).await;
                 }
@@ -468,6 +482,9 @@ pub fn run() {
             commands::gnn_save_weights,
             commands::compression_scan,
             commands::compression_stats,
+            commands::bootstrap_knowledge,
+            commands::browser_sync,
+            commands::browser_stats,
         ])
         .run(tauri::generate_context!())
         .expect("Error while running DeepBrain");

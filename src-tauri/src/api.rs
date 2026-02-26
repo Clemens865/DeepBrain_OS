@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::commands::{self, RecallItem, RememberResponse, ThinkResponse};
+use crate::commands::{self, KnowledgeBootstrapResult, RecallItem, RememberResponse, ThinkResponse};
 use crate::state::{AppSettings, AppState, SystemStatus};
 
 // ---- Request / Response types ----
@@ -92,6 +92,11 @@ struct SpotlightRequest {
 #[derive(Deserialize)]
 struct LoadModelRequest {
     model_id: String,
+}
+
+#[derive(Deserialize)]
+struct BootstrapKnowledgeRequest {
+    sources: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -480,18 +485,14 @@ async fn api_storage_verify(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let status = state.vector_store.status();
-    let metrics = state.vector_store.metrics();
     Json(serde_json::json!({
         "ok": true,
         "total_vectors": status.total_vectors,
         "file_size_bytes": status.file_size,
-        "current_epoch": status.current_epoch,
-        "dead_space_ratio": status.dead_space_ratio,
-        "id_map_count": metrics.id_map_count,
     }))
 }
 
-// ---- Migration: SQLite → RvfStore ----
+// ---- Migration: SQLite → VectorDB ----
 
 async fn api_migrate(
     AxumState(_state): AxumState<Arc<AppState>>,
@@ -720,7 +721,7 @@ async fn api_verify_all(
     let ollama_ok = crate::ai::ollama::list_models("http://127.0.0.1:11434").await.is_ok();
 
     Json(serde_json::json!({
-        "storage": { "ok": storage_metrics.dead_space_ratio < 0.5, "vectors": storage_metrics.total_vectors },
+        "storage": { "ok": true, "vectors": storage_metrics.total_vectors },
         "sona": { "ok": sona_stats.instant_enabled && sona_stats.background_enabled, "patterns": sona_stats.patterns_stored },
         "nervous": { "ok": nervous_stats.hopfield_capacity > 0, "hopfield_patterns": nervous_stats.hopfield_patterns },
         "llm": { "ok": llm_status.model_loaded, "model_id": llm_status.model_id },
@@ -740,6 +741,23 @@ async fn api_bootstrap_sona(
     commands::bootstrap_sona_impl(&state)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))
+}
+
+// ---- Knowledge bootstrap ----
+
+async fn api_bootstrap_knowledge(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<BootstrapKnowledgeRequest>,
+) -> Result<Json<KnowledgeBootstrapResult>, (StatusCode, Json<ErrorResponse>)> {
+    let result = crate::indexer::bootstrap::bootstrap_knowledge(&state, None, body.sources)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+    Ok(Json(KnowledgeBootstrapResult {
+        total_memories_created: result.total_memories_created,
+        total_skipped: result.total_skipped,
+        sources: result.sources,
+        duration_secs: result.duration_secs,
+    }))
 }
 
 // ---- Spotlight search ----
@@ -1213,6 +1231,25 @@ async fn api_compression_stats(
     }))
 }
 
+// ---- Browser History ----
+
+async fn api_browser_sync(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let count = commands::browser_sync_impl(&state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+    Ok(Json(serde_json::json!({ "indexed": count })))
+}
+
+async fn api_browser_stats(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    commands::browser_stats_impl(&state)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))
+}
+
 // ---- Server startup ----
 
 /// Start the HTTP API server. Call from main.rs via tokio::spawn.
@@ -1264,6 +1301,7 @@ pub async fn start_api_server(state: Arc<AppState>, port: u16) {
         // DeepBrain subsystems
         .route("/api/sona/stats", get(api_sona_stats))
         .route("/api/sona/bootstrap", post(api_bootstrap_sona))
+        .route("/api/bootstrap", post(api_bootstrap_knowledge))
         .route("/api/nervous/stats", get(api_nervous_stats))
         .route("/api/verify", post(api_verify_all))
         // LLM
@@ -1290,6 +1328,9 @@ pub async fn start_api_server(state: Arc<AppState>, port: u16) {
         // Tensor Compression
         .route("/api/compression/scan", post(api_compression_scan))
         .route("/api/compression/stats", get(api_compression_stats))
+        // Browser History
+        .route("/api/browser/sync", post(api_browser_sync))
+        .route("/api/browser/stats", get(api_browser_stats))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // CORS layer for browser access

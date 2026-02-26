@@ -2,7 +2,6 @@ pub mod compress_bridge;
 pub mod error;
 pub mod gnn_bridge;
 pub mod graph_bridge;
-pub mod id_map;
 pub mod llm_bridge;
 pub mod metrics;
 pub mod migration;

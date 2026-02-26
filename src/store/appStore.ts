@@ -64,11 +64,8 @@ interface Settings {
 export interface StorageMetrics {
   total_vectors: number;
   file_size_bytes: number;
-  current_epoch: number;
-  dead_space_ratio: number;
   query_latency_p50_us: number;
   query_latency_p99_us: number;
-  id_map_count: number;
 }
 
 export interface SonaStats {
@@ -127,6 +124,29 @@ export interface CompressionStats {
   warm_count: number;
   cold_count: number;
   estimated_savings_pct: number;
+}
+
+export interface BootstrapSourceResult {
+  source: string;
+  items_scanned: number;
+  memories_created: number;
+  skipped_existing: number;
+  errors: number;
+}
+
+export interface KnowledgeBootstrapResult {
+  total_memories_created: number;
+  total_skipped: number;
+  sources: BootstrapSourceResult[];
+  duration_secs: number;
+}
+
+export interface BootstrapProgress {
+  source: string;
+  phase: string;
+  current: number;
+  total: number;
+  memories_created: number;
 }
 
 export interface SpotlightResult {
@@ -314,6 +334,11 @@ interface AppState {
   verifyResult: VerifyResult | null;
   verifying: boolean;
 
+  // Bootstrap state
+  bootstrapRunning: boolean;
+  bootstrapProgress: BootstrapProgress | null;
+  bootstrapResult: KnowledgeBootstrapResult | null;
+
   setQuery: (query: string) => void;
   setMode: (mode: "search" | "remember" | "browse" | "chat") => void;
   search: (query: string) => Promise<void>;
@@ -355,6 +380,7 @@ interface AppState {
   loadModel: (modelId: string) => Promise<void>;
   unloadModel: () => Promise<void>;
   bootstrapSona: () => Promise<void>;
+  bootstrapKnowledge: (sources: string[]) => Promise<void>;
 
   // Pin / Expand actions
   setPinned: (pinned: boolean) => void;
@@ -417,6 +443,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   compressionStats: null,
   verifyResult: null,
   verifying: false,
+
+  // Bootstrap defaults
+  bootstrapRunning: false,
+  bootstrapProgress: null,
+  bootstrapResult: null,
 
   setQuery: (query: string) => set({ query }),
   setMode: (mode: "search" | "remember" | "browse" | "chat") => set({ mode }),
@@ -913,6 +944,25 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().loadDashboardData();
     } catch (error) {
       console.error("SONA bootstrap failed:", error);
+      get().addToast(`Bootstrap failed: ${error}`, "error");
+    }
+  },
+
+  bootstrapKnowledge: async (sources: string[]) => {
+    set({ bootstrapRunning: true, bootstrapProgress: null, bootstrapResult: null });
+    try {
+      const result = await invoke<KnowledgeBootstrapResult>("bootstrap_knowledge", { sources });
+      set({ bootstrapResult: result, bootstrapRunning: false });
+      get().addToast(
+        `Bootstrap complete: ${result.total_memories_created} memories created in ${result.duration_secs.toFixed(1)}s`,
+        "success"
+      );
+      // Refresh dashboard data to reflect new memories/graph
+      get().loadDashboardData();
+      get().loadStatus();
+    } catch (error) {
+      console.error("Knowledge bootstrap failed:", error);
+      set({ bootstrapRunning: false });
       get().addToast(`Bootstrap failed: ${error}`, "error");
     }
   },
