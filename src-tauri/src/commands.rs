@@ -1852,6 +1852,51 @@ pub async fn bootstrap_knowledge(
     bootstrap_knowledge_impl(sources, &state, Some(&app_handle)).await
 }
 
+// ---- Connectors ----
+
+/// List all available connectors with detection status and user config.
+pub fn list_connectors_impl(state: &AppState) -> Vec<crate::indexer::connectors::ConnectorInfo> {
+    let registry = crate::indexer::connectors::ConnectorRegistry::new();
+    let user_config = state.settings.read().connector_config.clone();
+    registry.list(&user_config)
+}
+
+#[tauri::command]
+pub fn list_connectors(
+    state: State<'_, Arc<AppState>>,
+) -> Vec<crate::indexer::connectors::ConnectorInfo> {
+    list_connectors_impl(&state)
+}
+
+/// Update configuration for a single connector.
+pub fn update_connector_config_impl(
+    connector_id: String,
+    config: crate::indexer::connectors::ConnectorConfig,
+    state: &AppState,
+) -> Result<(), String> {
+    {
+        let mut settings = state.settings.write();
+        settings.connector_config.insert(connector_id, config);
+    }
+    // Persist settings immediately
+    let settings = state.settings.read().clone();
+    let settings_json =
+        serde_json::to_string(&settings).map_err(|e| format!("Serialize error: {}", e))?;
+    state
+        .persistence
+        .store_config("app_settings", &settings_json)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_connector_config(
+    connector_id: String,
+    config: crate::indexer::connectors::ConnectorConfig,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    update_connector_config_impl(connector_id, config, &state)
+}
+
 // ---- Browser History Sync ----
 
 /// Trigger a manual browser history sync pass.

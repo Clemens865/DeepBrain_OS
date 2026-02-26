@@ -8,6 +8,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+use std::collections::HashMap;
+
 use crate::activity::ActivityObserver;
 use crate::ai::AiProvider;
 use crate::brain::cognitive::CognitiveEngine;
@@ -24,6 +26,7 @@ use crate::deepbrain::sona_bridge::SonaBridge;
 use crate::deepbrain::vector_store::DeepBrainVectorStore;
 use crate::indexer::FileIndexer;
 use crate::indexer::browser::BrowserIndexer;
+use crate::indexer::connectors::ConnectorConfig;
 use crate::indexer::email::EmailIndexer;
 
 /// Application settings
@@ -59,6 +62,9 @@ pub struct AppSettings {
     /// Activity tracking: days to retain events before pruning
     #[serde(default = "default_30")]
     pub activity_retention_days: u32,
+    /// Per-connector configuration (enable/disable, path overrides, importance)
+    #[serde(default)]
+    pub connector_config: HashMap<String, ConnectorConfig>,
 }
 
 fn default_true() -> bool {
@@ -90,6 +96,7 @@ impl Default for AppSettings {
             activity_track_browser: true,
             activity_track_terminal: false,
             activity_retention_days: 30,
+            connector_config: HashMap::new(),
         }
     }
 }

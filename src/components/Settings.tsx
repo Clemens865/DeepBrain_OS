@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { invoke, isTauri } from "../services/backend";
-import { useAppStore, type LlmStatus } from "../store/appStore";
+import { useAppStore, type LlmStatus, type ConnectorInfo, type ConnectorConfig } from "../store/appStore";
 
 interface CommonFolder {
   label: string;
@@ -13,7 +13,7 @@ interface SettingsProps {
 }
 
 export default function Settings({ onBack }: SettingsProps) {
-  const { settings, loadSettings, updateSettings, status, addIndexedFolder } = useAppStore();
+  const { settings, loadSettings, updateSettings, status, addIndexedFolder, connectors, loadConnectors, updateConnectorConfig } = useAppStore();
   const [localSettings, setLocalSettings] = useState(settings);
   const [commonFolders, setCommonFolders] = useState<CommonFolder[]>([]);
 
@@ -25,8 +25,9 @@ export default function Settings({ onBack }: SettingsProps) {
 
   useEffect(() => {
     loadSettings();
+    loadConnectors();
     invoke<CommonFolder[]>("get_common_folders").then(setCommonFolders).catch(console.error);
-  }, [loadSettings]);
+  }, [loadSettings, loadConnectors]);
 
   useEffect(() => {
     if (settings) {
@@ -241,6 +242,28 @@ export default function Settings({ onBack }: SettingsProps) {
           </button>
         </Section>
 
+        {/* Knowledge Connectors */}
+        <Section title="Knowledge Connectors">
+          <p className="text-brain-text/40 text-[11px] mb-3">
+            Configure which data sources are available for knowledge bootstrap.
+          </p>
+          <div className="space-y-2">
+            {connectors.map((c) => (
+              <ConnectorRow
+                key={c.id}
+                connector={c}
+                onToggle={(enabled) => updateConnectorConfig(c.id, { enabled })}
+              />
+            ))}
+          </div>
+          <button
+            onClick={loadConnectors}
+            className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-dashed border-brain-text/20 text-brain-text/40 text-xs hover:border-brain-accent/30 hover:text-brain-accent transition-colors mt-3"
+          >
+            Re-scan Sources
+          </button>
+        </Section>
+
         {/* Auto-Start */}
         <Section title="Startup">
           <Toggle
@@ -334,6 +357,59 @@ function Toggle({
         />
       </div>
     </label>
+  );
+}
+
+function ConnectorRow({
+  connector,
+  onToggle,
+}: {
+  connector: ConnectorInfo;
+  onToggle: (enabled: boolean) => void;
+}) {
+  return (
+    <div className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border transition-colors ${
+      connector.detected.available
+        ? "border-brain-border bg-brain-bg/30"
+        : "border-brain-border/50 bg-brain-bg/10 opacity-60"
+    }`}>
+      {/* Detection dot */}
+      <div className={`w-2 h-2 rounded-full flex-shrink-0 ${
+        connector.detected.available ? "bg-brain-success" : "bg-brain-text/20"
+      }`} />
+
+      {/* Info */}
+      <div className="flex-1 min-w-0">
+        <div className="text-white text-xs font-medium">{connector.name}</div>
+        <div className="text-brain-text/40 text-[10px] truncate">
+          {connector.detected.available
+            ? (connector.detected.details || connector.description)
+            : "Not detected"}
+        </div>
+      </div>
+
+      {/* Enable/disable toggle */}
+      <div
+        onClick={() => {
+          if (connector.detected.available) {
+            onToggle(!connector.enabled);
+          }
+        }}
+        className={`w-9 h-5 rounded-full transition-colors relative flex-shrink-0 ${
+          !connector.detected.available
+            ? "bg-brain-border/30 cursor-not-allowed"
+            : connector.enabled
+              ? "bg-brain-accent cursor-pointer"
+              : "bg-brain-border cursor-pointer"
+        }`}
+      >
+        <div
+          className={`w-3.5 h-3.5 rounded-full bg-white absolute top-[3px] transition-transform ${
+            connector.enabled && connector.detected.available ? "translate-x-[18px]" : "translate-x-[3px]"
+          }`}
+        />
+      </div>
+    </div>
   );
 }
 

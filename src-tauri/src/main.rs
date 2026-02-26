@@ -483,6 +483,8 @@ pub fn run() {
             commands::compression_scan,
             commands::compression_stats,
             commands::bootstrap_knowledge,
+            commands::list_connectors,
+            commands::update_connector_config,
             commands::browser_sync,
             commands::browser_stats,
         ])

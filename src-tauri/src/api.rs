@@ -760,6 +760,29 @@ async fn api_bootstrap_knowledge(
     }))
 }
 
+// ---- Connectors ----
+
+async fn api_list_connectors(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<Vec<crate::indexer::connectors::ConnectorInfo>> {
+    Json(commands::list_connectors_impl(&state))
+}
+
+#[derive(Deserialize)]
+struct UpdateConnectorConfigRequest {
+    config: crate::indexer::connectors::ConnectorConfig,
+}
+
+async fn api_update_connector_config(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(connector_id): Path<String>,
+    Json(body): Json<UpdateConnectorConfigRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    commands::update_connector_config_impl(connector_id, body.config, &state)
+        .map(|_| Json(serde_json::json!({ "ok": true })))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))
+}
+
 // ---- Spotlight search ----
 
 async fn api_spotlight(
@@ -1302,6 +1325,8 @@ pub async fn start_api_server(state: Arc<AppState>, port: u16) {
         .route("/api/sona/stats", get(api_sona_stats))
         .route("/api/sona/bootstrap", post(api_bootstrap_sona))
         .route("/api/bootstrap", post(api_bootstrap_knowledge))
+        .route("/api/connectors", get(api_list_connectors))
+        .route("/api/connectors/:id/config", axum::routing::put(api_update_connector_config))
         .route("/api/nervous/stats", get(api_nervous_stats))
         .route("/api/verify", post(api_verify_all))
         // LLM

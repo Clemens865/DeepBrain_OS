@@ -7,6 +7,7 @@ pub mod bootstrap;
 pub mod browser;
 pub mod chunker;
 pub mod claude_listener;
+pub mod connectors;
 pub mod email;
 pub mod parser;
 pub mod watcher;

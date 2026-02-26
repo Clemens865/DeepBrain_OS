@@ -126,6 +126,30 @@ export interface CompressionStats {
   estimated_savings_pct: number;
 }
 
+export interface DetectionResult {
+  available: boolean;
+  path: string | null;
+  details: string | null;
+}
+
+export interface ConnectorConfig {
+  enabled?: boolean;
+  path_override?: string;
+  importance_override?: number;
+  extra?: unknown;
+}
+
+export interface ConnectorInfo {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  detected: DetectionResult;
+  enabled: boolean;
+  memory_type: string;
+  default_importance: number;
+}
+
 export interface BootstrapSourceResult {
   source: string;
   items_scanned: number;
@@ -339,6 +363,9 @@ interface AppState {
   bootstrapProgress: BootstrapProgress | null;
   bootstrapResult: KnowledgeBootstrapResult | null;
 
+  // Connectors state
+  connectors: ConnectorInfo[];
+
   setQuery: (query: string) => void;
   setMode: (mode: "search" | "remember" | "browse" | "chat") => void;
   search: (query: string) => Promise<void>;
@@ -381,6 +408,8 @@ interface AppState {
   unloadModel: () => Promise<void>;
   bootstrapSona: () => Promise<void>;
   bootstrapKnowledge: (sources: string[]) => Promise<void>;
+  loadConnectors: () => Promise<void>;
+  updateConnectorConfig: (connectorId: string, config: ConnectorConfig) => Promise<void>;
 
   // Pin / Expand actions
   setPinned: (pinned: boolean) => void;
@@ -448,6 +477,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   bootstrapRunning: false,
   bootstrapProgress: null,
   bootstrapResult: null,
+
+  // Connectors defaults
+  connectors: [],
 
   setQuery: (query: string) => set({ query }),
   setMode: (mode: "search" | "remember" | "browse" | "chat") => set({ mode }),
@@ -964,6 +996,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       console.error("Knowledge bootstrap failed:", error);
       set({ bootstrapRunning: false });
       get().addToast(`Bootstrap failed: ${error}`, "error");
+    }
+  },
+
+  loadConnectors: async () => {
+    try {
+      const connectors = await invoke<ConnectorInfo[]>("list_connectors");
+      set({ connectors });
+    } catch (error) {
+      console.error("Failed to load connectors:", error);
+    }
+  },
+
+  updateConnectorConfig: async (connectorId: string, config: ConnectorConfig) => {
+    try {
+      await invoke("update_connector_config", { connectorId, config });
+      // Reload connectors to reflect changes
+      get().loadConnectors();
+      get().addToast(`Connector '${connectorId}' updated`, "success");
+    } catch (error) {
+      console.error("Failed to update connector config:", error);
+      get().addToast(`Failed to update connector: ${error}`, "error");
     }
   },
 

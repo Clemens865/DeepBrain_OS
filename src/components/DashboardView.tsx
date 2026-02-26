@@ -64,13 +64,26 @@ export default function DashboardView() {
     bootstrapRunning,
     bootstrapProgress,
     bootstrapResult,
+    connectors,
+    loadConnectors,
   } = useAppStore();
 
   const [modelInput, setModelInput] = useState("");
   const [bootstrapping, setBootstrapping] = useState(false);
-  const [selectedSources, setSelectedSources] = useState<Set<string>>(
-    new Set(["file_index", "claude_code", "claude_memory", "whatsapp", "browser", "deepnote"])
-  );
+  const [selectedSources, setSelectedSources] = useState<Set<string>>(new Set());
+  const [connectorsLoaded, setConnectorsLoaded] = useState(false);
+
+  // Initialize selected sources from connectors once loaded
+  useEffect(() => {
+    if (connectors.length > 0 && !connectorsLoaded) {
+      setSelectedSources(new Set(
+        connectors
+          .filter(c => c.detected.available && c.enabled)
+          .map(c => c.id)
+      ));
+      setConnectorsLoaded(true);
+    }
+  }, [connectors, connectorsLoaded]);
 
   const handleBootstrap = useCallback(async () => {
     setBootstrapping(true);
@@ -119,6 +132,7 @@ export default function DashboardView() {
   useEffect(() => {
     loadStatus();
     loadDashboardData();
+    loadConnectors();
     const interval = setInterval(() => {
       loadStatus();
       loadDashboardData();
@@ -152,29 +166,24 @@ export default function DashboardView() {
       <div className="bg-brain-surface rounded-xl p-4 border border-brain-border">
         <h3 className="text-white text-xs font-medium mb-3">Bootstrap Knowledge</h3>
         <div className="grid grid-cols-3 gap-2 mb-3">
-          {[
-            { id: "file_index", label: "Documents", desc: "md, pdf, txt, html..." },
-            { id: "claude_code", label: "Claude Code", desc: "Conversations" },
-            { id: "claude_memory", label: "Claude Memory", desc: "MEMORY.md files" },
-            { id: "claude_plans", label: "Claude Plans", desc: "Implementation plans" },
-            { id: "claude_desktop", label: "Claude Desktop", desc: "Agent sessions" },
-            { id: "claude_history", label: "Claude History", desc: "Session prompts" },
-            { id: "whatsapp", label: "WhatsApp", desc: "Chat messages" },
-            { id: "browser", label: "Browser", desc: "Comet history" },
-            { id: "deepnote", label: "Deepnote", desc: "AI notebooks" },
-          ].map(({ id, label, desc }) => (
+          {connectors.map((c) => (
             <button
-              key={id}
-              onClick={() => toggleSource(id)}
-              disabled={bootstrapRunning}
+              key={c.id}
+              onClick={() => toggleSource(c.id)}
+              disabled={bootstrapRunning || !c.detected.available}
               className={`flex flex-col items-start px-3 py-2 rounded-lg border text-left transition-colors ${
-                selectedSources.has(id)
+                selectedSources.has(c.id)
                   ? "border-brain-accent bg-brain-accent/10 text-brain-accent"
                   : "border-brain-border bg-brain-bg/50 text-brain-text/40"
               } disabled:opacity-50`}
             >
-              <span className="text-[11px] font-medium">{label}</span>
-              <span className="text-[9px] opacity-60">{desc}</span>
+              <div className="flex items-center gap-1.5 w-full">
+                <span className="text-[11px] font-medium">{c.name}</span>
+                <div className={`w-1.5 h-1.5 rounded-full ml-auto flex-shrink-0 ${
+                  c.detected.available ? "bg-brain-success" : "bg-brain-text/20"
+                }`} />
+              </div>
+              <span className="text-[9px] opacity-60">{c.description}</span>
             </button>
           ))}
         </div>
@@ -245,7 +254,7 @@ export default function DashboardView() {
         >
           {bootstrapRunning
             ? "Bootstrapping..."
-            : `Bootstrap ${selectedSources.size === 9 ? "All Sources" : `${selectedSources.size} Source${selectedSources.size !== 1 ? "s" : ""}`}`}
+            : `Bootstrap ${selectedSources.size === connectors.length ? "All Sources" : `${selectedSources.size} Source${selectedSources.size !== 1 ? "s" : ""}`}`}
         </button>
       </div>
 
