@@ -127,6 +127,21 @@ pub async fn store_as_memory(
     memory_type: &str,
     importance: f64,
 ) -> Result<bool, String> {
+    store_as_memory_with_summary(state, id, content, content, memory_type, importance).await
+}
+
+/// Store a memory where the embedding is computed from `embed_text` but the
+/// stored content is `content`. This allows embedding a concise summary while
+/// keeping the full original text searchable in the detail view.
+/// Returns true if newly created, false if skipped (existing).
+pub async fn store_as_memory_with_summary(
+    state: &AppState,
+    id: &str,
+    embed_text: &str,
+    content: &str,
+    memory_type: &str,
+    importance: f64,
+) -> Result<bool, String> {
     // Skip empty content
     if content.trim().len() < 20 {
         return Ok(false);
@@ -137,10 +152,10 @@ pub async fn store_as_memory(
         return Ok(false);
     }
 
-    // Embed
-    let vector = state.embeddings.embed(content).await?;
+    // Embed the summary text (not the full content)
+    let vector = state.embeddings.embed(embed_text).await?;
 
-    // Store with deterministic ID
+    // Store with deterministic ID (full content preserved)
     let created = state.engine.memory.store_f32_with_id(
         id.to_string(),
         content.to_string(),

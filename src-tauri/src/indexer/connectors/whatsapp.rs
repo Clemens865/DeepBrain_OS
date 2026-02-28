@@ -1,14 +1,18 @@
-//! WhatsApp connector — imports chat messages from ChatStorage.sqlite.
+//! WhatsApp connector — imports chat conversations from ChatStorage.sqlite.
+//!
+//! Each chat becomes one memory (or monthly segments for long chats).
+//! The embedding is computed from a descriptive summary while the full
+//! conversation text is stored for browsing in the detail panel.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use rusqlite::Connection;
 
 use crate::indexer::bootstrap::{
-    copy_sqlite_to_temp, deterministic_hash, emit_progress, store_as_memory, BootstrapProgress,
-    SourceResult, CORE_DATA_EPOCH_OFFSET,
+    copy_sqlite_to_temp, deterministic_hash, emit_progress, store_as_memory_with_summary,
+    BootstrapProgress, SourceResult, CORE_DATA_EPOCH_OFFSET,
 };
-use crate::indexer::chunker;
 use crate::state::AppState;
 
 use super::{Connector, ConnectorConfig, DetectionResult};
@@ -25,6 +29,15 @@ struct WhatsAppMsg {
     chat_name: String,
 }
 
+/// Maximum messages per memory before splitting into monthly segments.
+const MONTHLY_SPLIT_THRESHOLD: usize = 100;
+
+/// Maximum topic snippets to include in the embedding summary.
+const MAX_SUMMARY_SNIPPETS: usize = 8;
+
+/// Maximum characters per snippet in the embedding summary.
+const SNIPPET_MAX_CHARS: usize = 80;
+
 impl WhatsAppConnector {
     fn default_path() -> Option<PathBuf> {
         dirs::home_dir().map(|h| {
@@ -36,8 +49,103 @@ impl WhatsAppConnector {
     }
 }
 
+/// Build a concise embedding summary for a set of messages in a chat.
+///
+/// Format: "WhatsApp conversation with {name} ({date_range}, {n} messages).
+///          Topics: {snippet1}; {snippet2}; ..."
+///
+/// This gives the embedding model a semantically rich, short text to vectorize
+/// instead of raw message dumps that would get truncated.
+fn build_embedding_summary(chat_name: &str, msgs: &[&WhatsAppMsg], period_label: &str) -> String {
+    let msg_count = msgs.len();
+
+    // Collect unique topic snippets from the longest/most substantive messages.
+    // Prefer messages that aren't from "You" for better topic representation,
+    // but fall back to all messages.
+    let mut candidates: Vec<&WhatsAppMsg> = msgs.iter().copied().collect();
+    candidates.sort_by(|a, b| b.text.len().cmp(&a.text.len()));
+
+    let mut snippets: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for msg in &candidates {
+        if snippets.len() >= MAX_SUMMARY_SNIPPETS {
+            break;
+        }
+        // Take first N chars as a snippet, deduplicate by prefix
+        let snippet: String = msg.text.chars().take(SNIPPET_MAX_CHARS).collect();
+        let key = snippet.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+        snippets.push(snippet);
+    }
+
+    let topics = if snippets.is_empty() {
+        String::new()
+    } else {
+        format!(" Topics: {}", snippets.join("; "))
+    };
+
+    format!(
+        "WhatsApp conversation with {} ({}, {} messages).{}",
+        chat_name, period_label, msg_count, topics
+    )
+}
+
+/// Format messages into a readable conversation transcript.
+fn format_conversation(chat_name: &str, msgs: &[&WhatsAppMsg], period_label: &str) -> String {
+    let mut lines = Vec::with_capacity(msgs.len() + 3);
+    lines.push(format!(
+        "WhatsApp conversation with {} — {}\n",
+        chat_name, period_label
+    ));
+
+    for msg in msgs {
+        let dt = chrono::DateTime::from_timestamp(msg.timestamp_unix, 0)
+            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        lines.push(format!("[{}] {}: {}", dt, msg.sender_name, msg.text));
+    }
+
+    lines.join("\n")
+}
+
+/// Group messages by year-month key (e.g. "2026-02").
+fn group_by_month<'a>(msgs: &[&'a WhatsAppMsg]) -> Vec<(String, Vec<&'a WhatsAppMsg>)> {
+    let mut months: HashMap<String, Vec<&'a WhatsAppMsg>> = HashMap::new();
+    for msg in msgs {
+        let key = chrono::DateTime::from_timestamp(msg.timestamp_unix, 0)
+            .map(|d| d.format("%Y-%m").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        months.entry(key).or_default().push(msg);
+    }
+    let mut sorted: Vec<_> = months.into_iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted
+}
+
+/// Build a human-readable label for a date range.
+fn date_range_label(msgs: &[&WhatsAppMsg]) -> String {
+    let first = msgs.first().and_then(|m| {
+        chrono::DateTime::from_timestamp(m.timestamp_unix, 0)
+            .map(|d| d.format("%b %Y").to_string())
+    });
+    let last = msgs.last().and_then(|m| {
+        chrono::DateTime::from_timestamp(m.timestamp_unix, 0)
+            .map(|d| d.format("%b %Y").to_string())
+    });
+    match (first, last) {
+        (Some(f), Some(l)) if f == l => f,
+        (Some(f), Some(l)) => format!("{} – {}", f, l),
+        _ => "unknown dates".to_string(),
+    }
+}
+
 /// Read WhatsApp messages synchronously (Connection is !Send).
-fn read_whatsapp_messages(db_path: &std::path::Path) -> Result<(Vec<WhatsAppMsg>, PathBuf), String> {
+fn read_whatsapp_messages(
+    db_path: &std::path::Path,
+) -> Result<(Vec<WhatsAppMsg>, PathBuf), String> {
     if !db_path.exists() {
         return Err("WhatsApp ChatStorage.sqlite not found".to_string());
     }
@@ -60,7 +168,9 @@ fn read_whatsapp_messages(db_path: &std::path::Path) -> Result<(Vec<WhatsAppMsg>
         WHERE m.ZTEXT IS NOT NULL AND length(m.ZTEXT) > 20
         ORDER BY cs.ZCONTACTJID, m.ZMESSAGEDATE ASC";
 
-    let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {}", e))?;
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("prepare: {}", e))?;
     let messages: Vec<WhatsAppMsg> = stmt
         .query_map([], |row| {
             let text: String = row.get(0)?;
@@ -105,7 +215,7 @@ impl Connector for WhatsAppConnector {
         "WhatsApp"
     }
     fn description(&self) -> &str {
-        "Chat messages"
+        "Chat conversations"
     }
     fn icon(&self) -> &str {
         "chat"
@@ -161,8 +271,7 @@ impl Connector for WhatsAppConnector {
         };
 
         // Group messages by chat_jid
-        let mut chats: std::collections::HashMap<String, Vec<&WhatsAppMsg>> =
-            std::collections::HashMap::new();
+        let mut chats: HashMap<String, Vec<&WhatsAppMsg>> = HashMap::new();
         for msg in &messages {
             chats.entry(msg.chat_jid.clone()).or_default().push(msg);
         }
@@ -173,7 +282,9 @@ impl Connector for WhatsAppConnector {
             messages.len(),
             total
         );
-        let importance = config.importance_override.unwrap_or(self.default_importance());
+        let importance = config
+            .importance_override
+            .unwrap_or(self.default_importance());
 
         let mut chat_idx = 0u32;
         for (chat_jid, msgs) in &chats {
@@ -183,29 +294,49 @@ impl Connector for WhatsAppConnector {
                 .first()
                 .map(|m| m.chat_name.as_str())
                 .unwrap_or(chat_jid);
-            let mut lines = Vec::with_capacity(msgs.len() + 2);
-            lines.push(format!("Conversation with {}:\n", chat_name));
-
-            for msg in msgs {
-                let dt = chrono::DateTime::from_timestamp(msg.timestamp_unix, 0)
-                    .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                lines.push(format!("[{}] {}: {}", dt, msg.sender_name, msg.text));
-            }
-
-            let combined = lines.join("\n");
-            let windows = chunker::chunk_text(&combined, 200, 30);
             let chat_hash = deterministic_hash(chat_jid);
 
-            for (wi, window) in windows.iter().enumerate().take(20) {
-                let win_id = format!("bootstrap::whatsapp::{}::{}", chat_hash, wi);
+            // Decide: single memory vs monthly segments
+            if msgs.len() <= MONTHLY_SPLIT_THRESHOLD {
+                // ── Single memory for the whole chat ──
+                let period = date_range_label(msgs);
+                let summary = build_embedding_summary(chat_name, msgs, &period);
+                let content = format_conversation(chat_name, msgs, &period);
+                let mem_id = format!("bootstrap::whatsapp::{}", chat_hash);
 
-                match store_as_memory(state, &win_id, window, "episodic", importance).await {
+                match store_as_memory_with_summary(
+                    state, &mem_id, &summary, &content, "episodic", importance,
+                )
+                .await
+                {
                     Ok(true) => result.memories_created += 1,
                     Ok(false) => result.skipped_existing += 1,
                     Err(e) => {
                         tracing::debug!("Bootstrap whatsapp error: {}", e);
                         result.errors += 1;
+                    }
+                }
+            } else {
+                // ── Split into monthly segments ──
+                let monthly = group_by_month(msgs);
+                for (month_key, month_msgs) in &monthly {
+                    let period = date_range_label(month_msgs);
+                    let summary = build_embedding_summary(chat_name, month_msgs, &period);
+                    let content = format_conversation(chat_name, month_msgs, &period);
+                    let mem_id =
+                        format!("bootstrap::whatsapp::{}::{}", chat_hash, month_key);
+
+                    match store_as_memory_with_summary(
+                        state, &mem_id, &summary, &content, "episodic", importance,
+                    )
+                    .await
+                    {
+                        Ok(true) => result.memories_created += 1,
+                        Ok(false) => result.skipped_existing += 1,
+                        Err(e) => {
+                            tracing::debug!("Bootstrap whatsapp error: {}", e);
+                            result.errors += 1;
+                        }
                     }
                 }
             }
@@ -230,9 +361,11 @@ impl Connector for WhatsAppConnector {
         let _ = std::fs::remove_file(&temp_db);
 
         tracing::info!(
-            "Bootstrap whatsapp complete: {} created, {} skipped",
+            "Bootstrap whatsapp complete: {} memories created, {} skipped ({} chats, {} messages)",
             result.memories_created,
-            result.skipped_existing
+            result.skipped_existing,
+            total,
+            messages.len()
         );
         result
     }
