@@ -3,7 +3,9 @@
 //! Each connector encapsulates detection, configuration, and import logic
 //! for a single data source (WhatsApp, browser history, Claude conversations, etc.).
 
+pub mod apple_notes;
 pub mod browser;
+pub mod chromium;
 pub mod claude_code;
 pub mod claude_desktop;
 pub mod claude_history;
@@ -11,6 +13,9 @@ pub mod claude_memory;
 pub mod claude_plans;
 pub mod deepnote;
 pub mod file_index;
+pub mod firefox;
+pub mod obsidian;
+pub mod safari;
 pub mod whatsapp;
 
 use std::collections::HashMap;
@@ -101,7 +106,11 @@ impl ConnectorRegistry {
             Box::new(claude_desktop::ClaudeDesktopConnector),
             Box::new(claude_history::ClaudeHistoryConnector),
             Box::new(whatsapp::WhatsAppConnector),
-            Box::new(browser::BrowserConnector),
+            Box::new(chromium::ChromiumConnector),
+            Box::new(safari::SafariConnector),
+            Box::new(firefox::FirefoxConnector),
+            Box::new(apple_notes::AppleNotesConnector),
+            Box::new(obsidian::ObsidianConnector),
             Box::new(deepnote::DeepnoteConnector),
         ];
         Self { connectors }

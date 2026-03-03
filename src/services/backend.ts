@@ -118,6 +118,20 @@ const COMMAND_MAP: Record<string, Route> = {
 
   // Folders
   get_common_folders:  { method: "GET",  path: "/api/folders/common" },
+
+  // Brainwire cognitive memory
+  brainwire_status:         { method: "GET",  path: "/api/brainwire/status" },
+  brainwire_recall:         { method: "POST", path: "/api/brainwire/recall" },
+  brainwire_remember:       { method: "POST", path: "/api/brainwire/remember" },
+  brainwire_consolidate:    { method: "POST", path: "/api/brainwire/consolidate" },
+  brainwire_working_memory: { method: "GET",  path: "/api/brainwire/working-memory" },
+  brainwire_bridge_status:  { method: "GET",  path: "/api/brainwire/bridge/status" },
+  brainwire_bridge_import:  { method: "POST", path: "/api/brainwire/bridge/import" },
+
+  // Knowledge export
+  brainwire_export_knowledge:  { method: "POST", path: "/api/brainwire/export-knowledge" },
+  brainwire_knowledge_topics:  { method: "GET",  path: "/api/brainwire/knowledge/topics" },
+  brainwire_knowledge_topic:   { method: "GET",  path: "/api/brainwire/knowledge/topic/:slug" },
 };
 
 // Commands that only work in Tauri desktop mode
@@ -143,12 +157,16 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
     throw new Error(`No REST mapping for command: ${command}`);
   }
 
-  // Resolve path parameters (e.g., :id)
+  // Resolve path parameters (e.g., :id, :slug)
   let path = route.path;
   const body = args ? convertArgs(args) : {};
   if (path.includes(":id") && body.id) {
     path = path.replace(":id", encodeURIComponent(String(body.id)));
     delete body.id;
+  }
+  if (path.includes(":slug") && body.slug) {
+    path = path.replace(":slug", encodeURIComponent(String(body.slug)));
+    delete body.slug;
   }
 
   const token = getAuthToken();

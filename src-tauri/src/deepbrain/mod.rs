@@ -1,3 +1,4 @@
+pub mod brainwire_bridge;
 pub mod compress_bridge;
 pub mod error;
 pub mod gnn_bridge;

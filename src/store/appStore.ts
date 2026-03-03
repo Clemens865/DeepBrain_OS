@@ -126,6 +126,17 @@ export interface CompressionStats {
   estimated_savings_pct: number;
 }
 
+export interface BrainwireStats {
+  total_memories: number;
+  active_memories: number;
+  dormant_memories: number;
+  stm_entries: number;
+  consolidation_cycles: number;
+  avg_salience: number;
+  working_memory_items: number;
+  concept_count: number;
+}
+
 export interface DetectionResult {
   available: boolean;
   path: string | null;
@@ -250,7 +261,8 @@ export type BrowseCategory =
   | "spotlight"
   | "email"
   | "status"
-  | "knowledge-graph";
+  | "knowledge-graph"
+  | "knowledge-export";
 
 export interface MemoryBrowseItem {
   id: string;
@@ -355,6 +367,7 @@ interface AppState {
   llmStatus: LlmStatus | null;
   graphStats: GraphStats | null;
   compressionStats: CompressionStats | null;
+  brainwireStats: BrainwireStats | null;
   verifyResult: VerifyResult | null;
   verifying: boolean;
 
@@ -470,6 +483,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   llmStatus: null,
   graphStats: null,
   compressionStats: null,
+  brainwireStats: null,
   verifyResult: null,
   verifying: false,
 
@@ -921,15 +935,16 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   loadDashboardData: async () => {
     try {
-      const [storageMetrics, sonaStats, nervousStats, llmStatus, graphStats, compressionStats] = await Promise.all([
+      const [storageMetrics, sonaStats, nervousStats, llmStatus, graphStats, compressionStats, brainwireStats] = await Promise.all([
         invoke<StorageMetrics>("get_storage_metrics").catch(() => null),
         invoke<SonaStats>("get_sona_stats").catch(() => null),
         invoke<NervousStats>("get_nervous_stats").catch(() => null),
         invoke<LlmStatus>("local_model_status").catch(() => null),
         invoke<GraphStats>("graph_stats").catch(() => null),
         invoke<CompressionStats>("compression_scan").catch(() => null),
+        invoke<BrainwireStats>("brainwire_status").catch(() => null),
       ]);
-      set({ storageMetrics, sonaStats, nervousStats, llmStatus, graphStats, compressionStats });
+      set({ storageMetrics, sonaStats, nervousStats, llmStatus, graphStats, compressionStats, brainwireStats });
     } catch (error) {
       console.error("Failed to load dashboard data:", error);
     }

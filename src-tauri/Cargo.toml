@@ -1,6 +1,6 @@
 [package]
 name = "deepbrain-app"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "DeepBrain - Cognitive memory layer with RVF crash-safe vector storage"
 license = "MIT"
@@ -76,6 +76,12 @@ ruvector-nervous-system = { path = "../../ruvector-main/crates/ruvector-nervous-
 ruvector-graph = { path = "../../ruvector-main/crates/ruvector-graph", default-features = false, features = ["storage"] }
 ruvector-gnn = { path = "../../ruvector-main/crates/ruvector-gnn", default-features = false }
 ruvllm = { path = "../../ruvector-main/crates/ruvllm", default-features = false, features = ["async-runtime", "candle", "gguf-mmap", "parallel"] }
+
+# Brainwire cognitive memory layer
+brainwire-core = { path = "../../../Brainwire/crates/brainwire-core" }
+brainwire-store = { path = "../../../Brainwire/crates/brainwire-store" }
+brainwire-llm = { path = "../../../Brainwire/crates/brainwire-llm" }
+brainwire-engine = { path = "../../../Brainwire/crates/brainwire-engine" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -136,13 +136,5 @@ fn make_status_icon(status: TrayStatus) -> Image<'static> {
 
 /// Toggle the overlay window visibility
 fn toggle_overlay(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
-        } else {
-            let _ = window.show();
-            let _ = window.set_focus();
-            let _ = window.center();
-        }
-    }
+    crate::overlay::toggle(app);
 }

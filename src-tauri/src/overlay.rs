@@ -12,7 +12,7 @@ static PINNED: AtomicBool = AtomicBool::new(false);
 /// Minimum time (ms) the window must be visible before blur can hide it.
 /// This prevents the global-shortcut key-release from immediately dismissing
 /// the overlay on macOS.
-const BLUR_DEBOUNCE_MS: i64 = 300;
+const BLUR_DEBOUNCE_MS: i64 = 600;
 
 /// Toggle the overlay window
 pub fn toggle(app: &AppHandle) {

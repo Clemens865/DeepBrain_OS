@@ -17,6 +17,7 @@ use crate::brain::embeddings::EmbeddingModel;
 use crate::brain::persistence::BrainPersistence;
 use crate::brain::types::CognitiveConfig;
 use crate::context::ContextManager;
+use crate::deepbrain::brainwire_bridge::{DeepBrainEmbedAdapter, DeepBrainLlmAdapter};
 use crate::deepbrain::compress_bridge::CompressBridge;
 use crate::deepbrain::gnn_bridge::GnnBridge;
 use crate::deepbrain::graph_bridge::GraphBridge;
@@ -28,6 +29,8 @@ use crate::indexer::FileIndexer;
 use crate::indexer::browser::BrowserIndexer;
 use crate::indexer::connectors::ConnectorConfig;
 use crate::indexer::email::EmailIndexer;
+
+use brainwire_engine::BrainwireEngine;
 
 /// Application settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,8 +137,9 @@ pub struct AppState {
     pub compressor: Arc<CompressBridge>,
     pub vector_store: Arc<DeepBrainVectorStore>,
     pub activity: Arc<ActivityObserver>,
+    pub brainwire: Arc<BrainwireEngine>,
     pub ai_provider: RwLock<Option<Box<dyn AiProvider>>>,
-    pub settings: RwLock<AppSettings>,
+    pub settings: Arc<RwLock<AppSettings>>,
     pub shutdown: Notify,
 }
 
@@ -345,11 +349,29 @@ impl AppState {
         });
 
         let ai_provider = Self::build_ai_provider(&settings);
+        let settings = Arc::new(RwLock::new(settings));
 
         let indexer = Arc::new(indexer);
 
         // HNSW index is rebuilt from redb on VectorDB::new().
         tracing::info!("File indexer ready (VectorDB-backed)");
+
+        // Initialize Brainwire cognitive memory layer (separate storage, shared embeddings + AI)
+        let bw_store = Arc::new(
+            brainwire_store::RuvectorStore::new(
+                &data_dir.join("brainwire.db").to_string_lossy(),
+                384,
+            )
+            .map_err(|e| format!("Failed to open Brainwire store: {e}"))?,
+        );
+        let bw_embedder = Arc::new(DeepBrainEmbedAdapter(embeddings.clone()));
+        let bw_llm = Arc::new(DeepBrainLlmAdapter::new(
+            Arc::clone(&settings),
+            Arc::clone(&llm),
+        ));
+        let bw_config = brainwire_engine::engine::EngineConfig::default();
+        let brainwire = Arc::new(BrainwireEngine::new(bw_store, bw_llm, bw_embedder, bw_config));
+        tracing::info!("Brainwire cognitive memory layer initialized");
 
         Ok(Self {
             engine,
@@ -367,8 +389,9 @@ impl AppState {
             compressor,
             vector_store,
             activity,
+            brainwire,
             ai_provider: RwLock::new(ai_provider),
-            settings: RwLock::new(settings),
+            settings,
             shutdown: Notify::new(),
         })
     }

@@ -414,6 +414,54 @@ pub fn run() {
                 }
             });
 
+            // Start Brainwire background consolidation (every 30 minutes, battery-aware)
+            let bw_ref = app.state::<Arc<AppState>>().brainwire.clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait 5 minutes before first consolidation pass
+                tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+
+                loop {
+                    // On battery: consolidate every 60 min; plugged in: every 30 min
+                    let on_battery = is_on_battery();
+                    let delay = if on_battery {
+                        tokio::time::Duration::from_secs(3600)
+                    } else {
+                        tokio::time::Duration::from_secs(1800)
+                    };
+                    tokio::time::sleep(delay).await;
+
+                    match bw_ref.consolidate().await {
+                        Ok(report) => {
+                            if report.memories_consolidated > 0 || report.memories_decayed > 0 {
+                                tracing::info!(
+                                    "Brainwire consolidation: {} consolidated, {} new abstractions, {} decayed",
+                                    report.memories_consolidated,
+                                    report.new_abstractions,
+                                    report.memories_decayed,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Brainwire consolidation failed: {e}");
+                        }
+                    }
+                }
+            });
+
+            // Rebuild Brainwire concept graph on startup (after a short delay)
+            let bw_startup = app.state::<Arc<AppState>>().brainwire.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                match bw_startup.rebuild_concept_graph().await {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::info!("Brainwire concept graph rebuilt with {n} concepts");
+                        }
+                    }
+                    Err(e) => tracing::debug!("Brainwire concept graph rebuild: {e}"),
+                }
+            });
+
             // Start overlay hidden
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();
@@ -487,6 +535,18 @@ pub fn run() {
             commands::update_connector_config,
             commands::browser_sync,
             commands::browser_stats,
+            commands::brainwire_remember,
+            commands::brainwire_recall,
+            commands::brainwire_consolidate,
+            commands::brainwire_export_knowledge,
+            commands::brainwire_knowledge_topics,
+            commands::brainwire_knowledge_topic,
+            commands::brainwire_status,
+            commands::brainwire_focus,
+            commands::brainwire_defocus,
+            commands::brainwire_working_memory,
+            commands::brainwire_bridge_status,
+            commands::brainwire_bridge_import,
         ])
         .run(tauri::generate_context!())
         .expect("Error while running DeepBrain");

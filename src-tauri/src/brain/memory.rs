@@ -367,7 +367,9 @@ impl NativeMemory {
                     }
                 };
 
-                let adjusted_sim = similarity * (1.0 - node.decay as f32);
+                // Cap decay factor at 0.5 so similarity is never reduced by more than half.
+                let decay_factor = (1.0 - node.decay as f32).max(0.5);
+                let adjusted_sim = similarity * decay_factor;
 
                 if adjusted_sim >= min_sim {
                     Some((node.id.clone(), adjusted_sim, node.clone()))
@@ -385,6 +387,7 @@ impl NativeMemory {
             .map(|(id, similarity, node)| {
                 if let Some(mut entry) = self.memories.get_mut(&id) {
                     entry.access_count += 1;
+                    entry.decay = 0.0;
                 }
                 self.total_accesses.fetch_add(1, Ordering::Relaxed);
 
@@ -456,7 +459,9 @@ impl NativeMemory {
                     }
                 };
 
-                let adjusted_sim = similarity * (1.0 - node.decay as f32);
+                // Cap decay factor at 0.5 so similarity is never reduced by more than half.
+                let decay_factor = (1.0 - node.decay as f32).max(0.5);
+                let adjusted_sim = similarity * decay_factor;
 
                 if adjusted_sim >= min_sim {
                     Some((node.id.clone(), adjusted_sim, node.clone()))
@@ -474,6 +479,7 @@ impl NativeMemory {
             .map(|(id, similarity, node)| {
                 if let Some(mut entry) = self.memories.get_mut(&id) {
                     entry.access_count += 1;
+                    entry.decay = 0.0;
                 }
                 self.total_accesses.fetch_add(1, Ordering::Relaxed);
 
@@ -528,7 +534,9 @@ impl NativeMemory {
                 }
 
                 // Apply decay adjustment to similarity score.
-                let adjusted_sim = vr.similarity as f32 * (1.0 - node.decay as f32);
+                // Cap decay factor at 0.5 so similarity is never reduced by more than half.
+                let decay_factor = (1.0 - node.decay as f32).max(0.5);
+                let adjusted_sim = vr.similarity as f32 * decay_factor;
 
                 if adjusted_sim < min_sim {
                     return None;
@@ -551,10 +559,12 @@ impl NativeMemory {
         });
         results.truncate(k as usize);
 
-        // Update access counts.
+        // Update access counts and reset decay — recalled memories are actively
+        // useful and should not decay away.
         for r in &results {
             if let Some(mut entry) = self.memories.get_mut(&r.id) {
                 entry.access_count += 1;
+                entry.decay = 0.0;
             }
             self.total_accesses.fetch_add(1, Ordering::Relaxed);
         }

@@ -1,7 +1,7 @@
 //! Tauri IPC command handlers for DeepBrain
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::ai::AiProvider;
 use std::sync::Arc;
@@ -18,15 +18,20 @@ pub struct ThinkResponse {
     pub ai_enhanced: bool,
 }
 
-/// Truncate a string to at most `max` chars on a word boundary.
+/// Truncate a string to at most `max` bytes on a char/word boundary.
 fn truncate_chars(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
-    // Find last space before max to avoid cutting mid-word
-    match s[..max].rfind(char::is_whitespace) {
+    // Find a valid char boundary at or before `max`
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    // Try to break on a word boundary
+    match s[..end].rfind(char::is_whitespace) {
         Some(pos) => &s[..pos],
-        None => &s[..max],
+        None => &s[..end],
     }
 }
 
@@ -159,6 +164,26 @@ pub async fn think_impl(input: &str, state: &AppState) -> Result<ThinkResponse, 
                 graph_additions.len()
             );
             memories.extend(graph_additions);
+        }
+    }
+
+    // Brainwire cognitive recall (context-aware, concept-graph-boosted)
+    if let Ok(bw_results) = state.brainwire.recall(input, 3, None, None).await {
+        let existing_ids: std::collections::HashSet<String> =
+            memories.iter().map(|m| m.id.clone()).collect();
+        for sm in &bw_results {
+            let id_str = sm.memory.id.to_string();
+            if !existing_ids.contains(&id_str) {
+                memories.push(crate::brain::cognitive::RecallResult {
+                    id: id_str,
+                    content: sm.memory.gist.clone(),
+                    similarity: sm.score as f64,
+                    memory_type: match sm.memory.kind {
+                        brainwire_core::MemoryKind::Episodic => "Episodic".to_string(),
+                        brainwire_core::MemoryKind::Semantic => "Semantic".to_string(),
+                    },
+                });
+            }
         }
     }
 
@@ -354,6 +379,18 @@ pub async fn remember(
                 );
             }
         }
+    }
+
+    // Also store in Brainwire cognitive memory (fire-and-forget)
+    {
+        let bw = Arc::clone(&state.brainwire);
+        let text = content_for_graph.clone();
+        tokio::spawn(async move {
+            if let Err(e) = bw.remember(text, None).await {
+                tracing::debug!("Brainwire remember failed: {e}");
+            }
+            let _ = bw.flush_stm().await;
+        });
     }
 
     let memory_count = state.engine.memory.len();
@@ -1933,4 +1970,502 @@ pub fn browser_stats(
 #[tauri::command]
 pub fn flush(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.flush()
+}
+
+// ---- Brainwire Cognitive Memory ----
+
+#[tauri::command]
+pub async fn brainwire_remember(
+    text: String,
+    topic: Option<String>,
+    project: Option<String>,
+    who: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let ctx = if topic.is_some() || project.is_some() || who.is_some() {
+        Some(brainwire_core::ContextFrame {
+            topic,
+            project,
+            who,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
+    let ids = state
+        .brainwire
+        .remember(text, ctx)
+        .await
+        .map_err(|e| format!("Brainwire remember error: {e}"))?;
+
+    // Flush STM to encode immediately
+    let encoded = state
+        .brainwire
+        .flush_stm()
+        .await
+        .map_err(|e| format!("Brainwire flush error: {e}"))?;
+
+    Ok(serde_json::json!({
+        "stm_ids": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "encoded_ids": encoded.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+    }))
+}
+
+#[tauri::command]
+pub async fn brainwire_recall(
+    query: String,
+    limit: Option<usize>,
+    topic: Option<String>,
+    kind: Option<String>,
+    reconstruct: Option<bool>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let ctx = topic.map(|t| brainwire_core::ContextFrame {
+        topic: Some(t),
+        ..Default::default()
+    });
+
+    let kind_filter = kind.and_then(|k| match k.to_lowercase().as_str() {
+        "episodic" => Some(brainwire_core::MemoryKind::Episodic),
+        "semantic" => Some(brainwire_core::MemoryKind::Semantic),
+        _ => None,
+    });
+
+    let limit = limit.unwrap_or(5);
+
+    let results = if reconstruct.unwrap_or(false) {
+        state
+            .brainwire
+            .recall_reconstructed(&query, limit, ctx.as_ref(), kind_filter)
+            .await
+    } else {
+        state
+            .brainwire
+            .recall(&query, limit, ctx.as_ref(), kind_filter)
+            .await
+    }
+    .map_err(|e| format!("Brainwire recall error: {e}"))?;
+
+    let items: Vec<serde_json::Value> = results
+        .iter()
+        .map(|sm| {
+            serde_json::json!({
+                "id": sm.memory.id.to_string(),
+                "gist": sm.memory.gist,
+                "concepts": sm.memory.concepts,
+                "kind": format!("{:?}", sm.memory.kind),
+                "score": sm.score,
+                "vector_similarity": sm.vector_similarity,
+                "activation": sm.activation,
+                "salience": sm.memory.salience,
+                "reconstructed": sm.reconstructed,
+                "created_at": sm.memory.created_at,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({ "results": items }))
+}
+
+#[tauri::command]
+pub async fn brainwire_consolidate(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let report = state
+        .brainwire
+        .consolidate()
+        .await
+        .map_err(|e| format!("Brainwire consolidation error: {e}"))?;
+
+    Ok(serde_json::json!({
+        "memories_processed": report.memories_processed,
+        "clusters_found": report.clusters_found,
+        "memories_consolidated": report.memories_consolidated,
+        "new_abstractions": report.new_abstractions,
+        "memories_decayed": report.memories_decayed,
+    }))
+}
+
+#[tauri::command]
+pub async fn brainwire_export_knowledge(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let data_dir = dirs::data_dir()
+        .ok_or("No data dir")?
+        .join("DeepBrain")
+        .join("knowledge");
+    let report = state
+        .brainwire
+        .export_knowledge_markdown(&data_dir)
+        .await
+        .map_err(|e| format!("Export error: {e}"))?;
+    Ok(serde_json::json!({
+        "topics_written": report.topics_written,
+        "memories_exported": report.memories_exported,
+        "output_path": report.output_path,
+    }))
+}
+
+#[tauri::command]
+pub async fn brainwire_knowledge_topics(
+    _state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let topics_dir = dirs::data_dir()
+        .ok_or("No data dir")?
+        .join("DeepBrain")
+        .join("knowledge")
+        .join("topics");
+
+    let mut topics = Vec::new();
+    if topics_dir.exists() {
+        let mut entries: Vec<_> = std::fs::read_dir(&topics_dir)
+            .map_err(|e| format!("Read dir: {e}"))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            let slug = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let metadata = std::fs::metadata(&path).ok();
+            let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified_ts = metadata
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Read first line for topic name
+            let name = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| {
+                    content.lines().next().and_then(|line| {
+                        line.strip_prefix("# ").map(|s| s.to_string())
+                    })
+                })
+                .unwrap_or_else(|| slug.replace('-', " "));
+
+            // Count memory entries (lines starting with "### ")
+            let memory_count = std::fs::read_to_string(&path)
+                .ok()
+                .map(|c| c.lines().filter(|l| l.starts_with("### ")).count())
+                .unwrap_or(0);
+
+            topics.push(serde_json::json!({
+                "slug": slug,
+                "name": name,
+                "size_bytes": size_bytes,
+                "modified_ts": modified_ts,
+                "memory_count": memory_count,
+            }));
+        }
+    }
+
+    // Read stats from consolidation-log.md if present
+    let log_path = dirs::data_dir()
+        .unwrap()
+        .join("DeepBrain")
+        .join("knowledge")
+        .join("consolidation-log.md");
+    let stats = if log_path.exists() {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        // Parse last export entry stats
+        let mut topics_written = 0u64;
+        let mut memories_exported = 0u64;
+        let mut consolidation_cycles = 0u64;
+        let mut avg_salience = 0.0f64;
+        for line in log.lines() {
+            if let Some(v) = line.strip_prefix("- Topics written: ") {
+                topics_written = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("- Memories exported: ") {
+                memories_exported = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("- Consolidation cycles: ") {
+                consolidation_cycles = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("- Avg salience: ") {
+                avg_salience = v.trim().parse().unwrap_or(0.0);
+            }
+        }
+        serde_json::json!({
+            "topics_written": topics_written,
+            "memories_exported": memories_exported,
+            "consolidation_cycles": consolidation_cycles,
+            "avg_salience": avg_salience,
+        })
+    } else {
+        serde_json::json!(null)
+    };
+
+    // Last exported = most recent modified_ts across topic files
+    let last_exported = topics.iter()
+        .filter_map(|t| t.get("modified_ts").and_then(|v| v.as_u64()))
+        .max()
+        .unwrap_or(0);
+
+    Ok(serde_json::json!({
+        "topics": topics,
+        "stats": stats,
+        "last_exported": if last_exported > 0 { serde_json::json!(last_exported) } else { serde_json::json!(null) },
+    }))
+}
+
+#[tauri::command]
+pub async fn brainwire_knowledge_topic(
+    _state: State<'_, Arc<AppState>>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    // Sanitize slug to prevent path traversal
+    if slug.contains("..") || slug.contains('/') || slug.contains('\\') {
+        return Err("Invalid slug".into());
+    }
+
+    let path = dirs::data_dir()
+        .ok_or("No data dir")?
+        .join("DeepBrain")
+        .join("knowledge")
+        .join("topics")
+        .join(format!("{slug}.md"));
+
+    if !path.exists() {
+        return Err(format!("Topic '{slug}' not found"));
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Read error: {e}"))?;
+
+    Ok(serde_json::json!({
+        "slug": slug,
+        "content": content,
+    }))
+}
+
+#[tauri::command]
+pub async fn brainwire_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let stats = state
+        .brainwire
+        .status()
+        .await
+        .map_err(|e| format!("Brainwire status error: {e}"))?;
+
+    Ok(serde_json::json!({
+        "total_memories": stats.total_memories,
+        "active_memories": stats.active_memories,
+        "dormant_memories": stats.dormant_memories,
+        "stm_entries": stats.stm_entries,
+        "consolidation_cycles": stats.consolidation_cycles,
+        "avg_salience": stats.avg_salience,
+        "working_memory_items": stats.working_memory_items,
+        "concept_count": stats.concept_count,
+    }))
+}
+
+#[tauri::command]
+pub async fn brainwire_focus(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    state
+        .brainwire
+        .focus(&id)
+        .await
+        .map_err(|e| format!("Brainwire focus error: {e}"))
+}
+
+#[tauri::command]
+pub async fn brainwire_defocus(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    state
+        .brainwire
+        .defocus(&id)
+        .await
+        .map_err(|e| format!("Brainwire defocus error: {e}"))
+}
+
+#[tauri::command]
+pub async fn brainwire_working_memory(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let items = state.brainwire.working_memory().await;
+
+    let wm: Vec<serde_json::Value> = items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "memory_id": item.memory_id.to_string(),
+                "gist": item.gist,
+                "concepts": item.concepts,
+                "activated_at": item.activated_at,
+                "relevance": item.relevance,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({ "items": wm }))
+}
+
+// ---- Brainwire Bridge Import ----
+
+#[tauri::command]
+pub async fn brainwire_bridge_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let (total, processed) = state.persistence.brainwire_bridge_counts()?;
+    Ok(serde_json::json!({
+        "total": total,
+        "processed": processed,
+        "remaining": total.saturating_sub(processed),
+    }))
+}
+
+#[tauri::command]
+pub async fn brainwire_bridge_import(
+    batch_size: Option<usize>,
+    limit: Option<usize>,
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    let batch_size = batch_size.unwrap_or(10);
+    let limit = limit.unwrap_or(batch_size);
+    let (total, already_done) = state.persistence.brainwire_bridge_counts()?;
+
+    tracing::info!(
+        "Bridge import: total={}, already_done={}, fetching limit={}",
+        total, already_done, limit
+    );
+
+    let rows = state.persistence.fetch_unprocessed_memories(limit)?;
+    if rows.is_empty() {
+        tracing::info!("Bridge import: no unprocessed rows, done");
+        return Ok(serde_json::json!({
+            "processed": 0,
+            "errors": 0,
+            "total": total,
+            "remaining": 0,
+        }));
+    }
+
+    tracing::info!("Bridge import: processing {} rows", rows.len());
+
+    let mut processed = 0usize;
+    let mut errors = 0usize;
+
+    for (db_id, content, vector_blob, memory_type) in &rows {
+        // Decode vector BLOB → Vec<f32> (384-dim, little-endian)
+        let embedding: Vec<f32> = vector_blob
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        if embedding.is_empty() {
+            errors += 1;
+            continue;
+        }
+
+        // Parse context from ID pattern
+        let context = context_from_id(db_id);
+
+        // Map memory_type to MemoryKind
+        let kind = if memory_type == "Episodic" {
+            brainwire_core::MemoryKind::Episodic
+        } else {
+            brainwire_core::MemoryKind::Semantic
+        };
+
+        // Truncate content for LLM encoding (avoid huge prompts)
+        let text = truncate_chars(content, 2000);
+
+        match state
+            .brainwire
+            .ingest_raw(text, embedding, kind, Some(context))
+            .await
+        {
+            Ok(bw_id) => {
+                // Fetch gist from the newly created record
+                let (gist, concepts) = match state.brainwire.inspect(&bw_id.to_string()).await {
+                    Ok(Some(rec)) => (
+                        Some(rec.gist.clone()),
+                        Some(rec.concepts.join(", ")),
+                    ),
+                    _ => (None, None),
+                };
+
+                let _ = state.persistence.insert_brainwire_ref(
+                    db_id,
+                    &bw_id.to_string(),
+                    gist.as_deref(),
+                    concepts.as_deref(),
+                );
+
+                processed += 1;
+
+                // Emit progress event
+                let _ = app.emit(
+                    "brainwire-bridge-progress",
+                    serde_json::json!({
+                        "processed": already_done + processed,
+                        "total": total,
+                        "current_id": db_id,
+                        "gist": gist.unwrap_or_default(),
+                    }),
+                );
+            }
+            Err(e) => {
+                tracing::error!("Bridge import FAILED for {}: {}", db_id, e);
+                errors += 1;
+            }
+        }
+    }
+
+    let (new_total, new_processed) = state
+        .persistence
+        .brainwire_bridge_counts()
+        .unwrap_or((total, already_done + processed));
+
+    Ok(serde_json::json!({
+        "processed": processed,
+        "errors": errors,
+        "total": new_total,
+        "remaining": new_total.saturating_sub(new_processed),
+    }))
+}
+
+/// Derive a ContextFrame from a DeepBrain memory ID pattern.
+fn context_from_id(id: &str) -> brainwire_core::ContextFrame {
+    let mut ctx = brainwire_core::ContextFrame::default();
+
+    if id.starts_with("bootstrap::file::") {
+        ctx.project = Some("local_files".to_string());
+        ctx.topic = Some("file".to_string());
+    } else if id.starts_with("bootstrap::claude_code::") {
+        ctx.who = Some("claude".to_string());
+        ctx.topic = Some("code".to_string());
+        ctx.project = Some("claude_code".to_string());
+    } else if id.starts_with("bootstrap::claude_memory::") {
+        ctx.who = Some("claude".to_string());
+        ctx.topic = Some("memory".to_string());
+    } else if id.starts_with("bootstrap::claude_plan::") {
+        ctx.who = Some("claude".to_string());
+        ctx.topic = Some("planning".to_string());
+    } else if id.starts_with("bootstrap::claude::") {
+        ctx.who = Some("claude".to_string());
+        ctx.topic = Some("conversation".to_string());
+    } else if id.starts_with("bootstrap::comet::") || id.starts_with("browser::comet::") {
+        ctx.topic = Some("browser".to_string());
+    } else if id.starts_with("bootstrap::whatsapp::") {
+        ctx.who = Some("whatsapp".to_string());
+        ctx.topic = Some("messaging".to_string());
+    } else if id.starts_with("bootstrap::deepnote::") {
+        ctx.topic = Some("notes".to_string());
+        ctx.project = Some("deepnote".to_string());
+    } else {
+        // UUID format or unknown — tag as direct entry
+        ctx.tags = vec!["source:direct".to_string()];
+    }
+
+    ctx
 }

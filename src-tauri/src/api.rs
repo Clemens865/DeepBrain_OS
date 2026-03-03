@@ -659,6 +659,215 @@ async fn api_flush(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))
 }
 
+// ---- BrainWire cognitive memory ----
+
+async fn api_brainwire_consolidate(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let report = state
+        .brainwire
+        .consolidate()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Consolidation error: {e}") })))?;
+
+    Ok(Json(serde_json::json!({
+        "memories_processed": report.memories_processed,
+        "clusters_found": report.clusters_found,
+        "memories_consolidated": report.memories_consolidated,
+        "new_abstractions": report.new_abstractions,
+        "memories_decayed": report.memories_decayed,
+    })))
+}
+
+async fn api_brainwire_export_knowledge(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let data_dir = dirs::data_dir()
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "No data dir".into() })))?
+        .join("DeepBrain")
+        .join("knowledge");
+    let report = state
+        .brainwire
+        .export_knowledge_markdown(&data_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Export error: {e}") })))?;
+
+    Ok(Json(serde_json::json!({
+        "topics_written": report.topics_written,
+        "memories_exported": report.memories_exported,
+        "output_path": report.output_path,
+    })))
+}
+
+async fn api_brainwire_status(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let stats = state
+        .brainwire
+        .status()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Brainwire status error: {e}") })))?;
+
+    Ok(Json(serde_json::json!({
+        "total_memories": stats.total_memories,
+        "active_memories": stats.active_memories,
+        "dormant_memories": stats.dormant_memories,
+        "stm_entries": stats.stm_entries,
+        "consolidation_cycles": stats.consolidation_cycles,
+        "avg_salience": stats.avg_salience,
+        "working_memory_items": stats.working_memory_items,
+        "concept_count": stats.concept_count,
+    })))
+}
+
+async fn api_brainwire_working_memory(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let items = state.brainwire.working_memory().await;
+
+    let wm: Vec<serde_json::Value> = items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "memory_id": item.memory_id.to_string(),
+                "gist": item.gist,
+                "concepts": item.concepts,
+                "activated_at": item.activated_at,
+                "relevance": item.relevance,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "items": wm }))
+}
+
+// ---- Knowledge topic browsing ----
+
+async fn api_brainwire_knowledge_topics(
+    AxumState(_state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let topics_dir = dirs::data_dir()
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "No data dir".into() })))?
+        .join("DeepBrain")
+        .join("knowledge")
+        .join("topics");
+
+    let mut topics = Vec::new();
+    if topics_dir.exists() {
+        let mut entries: Vec<_> = std::fs::read_dir(&topics_dir)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Read dir: {e}") })))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            let slug = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let metadata = std::fs::metadata(&path).ok();
+            let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified_ts = metadata
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let name = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| {
+                    content.lines().next().and_then(|line| {
+                        line.strip_prefix("# ").map(|s| s.to_string())
+                    })
+                })
+                .unwrap_or_else(|| slug.replace('-', " "));
+
+            let memory_count = std::fs::read_to_string(&path)
+                .ok()
+                .map(|c| c.lines().filter(|l| l.starts_with("### ")).count())
+                .unwrap_or(0);
+
+            topics.push(serde_json::json!({
+                "slug": slug,
+                "name": name,
+                "size_bytes": size_bytes,
+                "modified_ts": modified_ts,
+                "memory_count": memory_count,
+            }));
+        }
+    }
+
+    let log_path = dirs::data_dir()
+        .unwrap()
+        .join("DeepBrain")
+        .join("knowledge")
+        .join("consolidation-log.md");
+    let stats = if log_path.exists() {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let mut topics_written = 0u64;
+        let mut memories_exported = 0u64;
+        let mut consolidation_cycles = 0u64;
+        let mut avg_salience = 0.0f64;
+        for line in log.lines() {
+            if let Some(v) = line.strip_prefix("- Topics written: ") {
+                topics_written = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("- Memories exported: ") {
+                memories_exported = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("- Consolidation cycles: ") {
+                consolidation_cycles = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("- Avg salience: ") {
+                avg_salience = v.trim().parse().unwrap_or(0.0);
+            }
+        }
+        serde_json::json!({
+            "topics_written": topics_written,
+            "memories_exported": memories_exported,
+            "consolidation_cycles": consolidation_cycles,
+            "avg_salience": avg_salience,
+        })
+    } else {
+        serde_json::json!(null)
+    };
+
+    let last_exported = topics.iter()
+        .filter_map(|t| t.get("modified_ts").and_then(|v| v.as_u64()))
+        .max()
+        .unwrap_or(0);
+
+    Ok(Json(serde_json::json!({
+        "topics": topics,
+        "stats": stats,
+        "last_exported": if last_exported > 0 { serde_json::json!(last_exported) } else { serde_json::json!(null) },
+    })))
+}
+
+async fn api_brainwire_knowledge_topic(
+    AxumState(_state): AxumState<Arc<AppState>>,
+    Path(slug): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    if slug.contains("..") || slug.contains('/') || slug.contains('\\') {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "Invalid slug".into() })));
+    }
+
+    let path = dirs::data_dir()
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "No data dir".into() })))?
+        .join("DeepBrain")
+        .join("knowledge")
+        .join("topics")
+        .join(format!("{slug}.md"));
+
+    if !path.exists() {
+        return Err((StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("Topic '{slug}' not found") })));
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Read error: {e}") })))?;
+
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "content": content,
+    })))
+}
+
 // ---- LLM management ----
 
 async fn api_load_model(
@@ -1309,6 +1518,13 @@ pub async fn start_api_server(state: Arc<AppState>, port: u16) {
         .route("/api/brain/evolve", post(api_evolve))
         .route("/api/brain/cycle", post(api_cycle))
         .route("/api/brain/flush", post(api_flush))
+        // BrainWire cognitive memory
+        .route("/api/brainwire/consolidate", post(api_brainwire_consolidate))
+        .route("/api/brainwire/export-knowledge", post(api_brainwire_export_knowledge))
+        .route("/api/brainwire/status", get(api_brainwire_status))
+        .route("/api/brainwire/working-memory", get(api_brainwire_working_memory))
+        .route("/api/brainwire/knowledge/topics", get(api_brainwire_knowledge_topics))
+        .route("/api/brainwire/knowledge/topic/:slug", get(api_brainwire_knowledge_topic))
         // Email
         .route("/api/email/stats", get(api_email_stats))
         .route("/api/email/index", post(api_index_emails))

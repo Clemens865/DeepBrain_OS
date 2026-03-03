@@ -147,9 +147,11 @@ impl CognitiveEngine {
         k: Option<u32>,
         memory_types: Option<Vec<String>>,
     ) -> Result<Vec<RecallResult>, String> {
+        // Use a low threshold (0.05) to let more candidates through — the AI
+        // can ignore weak matches, but dropping them here is irreversible.
         let results =
             self.memory
-                .search_f32(query_vector, k.unwrap_or(10), memory_types, Some(0.2))?;
+                .search_f32(query_vector, k.unwrap_or(10), memory_types, Some(0.05))?;
 
         Ok(results
             .into_iter()

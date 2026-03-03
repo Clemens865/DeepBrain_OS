@@ -1,12 +1,18 @@
-import { useEffect } from "react";
-import { useAppStore } from "../store/appStore";
+import { useEffect, useState } from "react";
+import { useAppStore, type BrainwireStats } from "../store/appStore";
+import { invoke } from "../services/backend";
 
 export default function MemoryFeed() {
   const { status, loadStatus } = useAppStore();
+  const [bwStats, setBwStats] = useState<BrainwireStats | null>(null);
 
   useEffect(() => {
     loadStatus();
-    const interval = setInterval(loadStatus, 10000);
+    invoke<BrainwireStats>("brainwire_status").then(setBwStats).catch(() => {});
+    const interval = setInterval(() => {
+      loadStatus();
+      invoke<BrainwireStats>("brainwire_status").then(setBwStats).catch(() => {});
+    }, 10000);
     return () => clearInterval(interval);
   }, [loadStatus]);
 
@@ -36,6 +42,19 @@ export default function MemoryFeed() {
           />
         </div>
       </div>
+
+      {/* Brainwire status row */}
+      {bwStats && (
+        <div className="bg-brain-surface rounded-xl p-3 border border-brain-border mb-3">
+          <div className="flex items-center gap-2">
+            <div className={`w-2 h-2 rounded-full ${bwStats.total_memories > 0 ? "bg-brain-success" : "bg-brain-text/20"}`} />
+            <span className="text-white text-xs font-medium">Brainwire</span>
+            <span className="text-brain-text/40 text-[10px] ml-auto">
+              {bwStats.total_memories} memories &middot; {bwStats.concept_count} concepts &middot; {bwStats.working_memory_items} in focus
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Tips */}
       <div className="text-brain-text/40 text-xs space-y-1.5 px-1">

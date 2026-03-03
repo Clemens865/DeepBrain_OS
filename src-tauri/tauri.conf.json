@@ -1,7 +1,7 @@
 {
   "productName": "DeepBrain",
   "identifier": "com.deepbrain.app",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",

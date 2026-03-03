@@ -122,6 +122,15 @@ impl BrainPersistence {
                 data BLOB NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS brainwire_refs (
+                deepbrain_id  TEXT PRIMARY KEY,
+                brainwire_id  TEXT NOT NULL,
+                processed_at  INTEGER NOT NULL,
+                gist          TEXT,
+                concepts      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_bw_refs_brainwire ON brainwire_refs(brainwire_id);
             ",
         )
         .map_err(|e| format!("Failed to create tables: {}", e))?;
@@ -437,6 +446,79 @@ impl BrainPersistence {
         )
         .map_err(|e| format!("Failed to store blob: {}", e))?;
 
+        Ok(())
+    }
+
+    // ---- Brainwire Bridge Refs ----
+
+    /// Count how many memories have been bridged vs total.
+    pub fn brainwire_bridge_counts(&self) -> Result<(usize, usize), String> {
+        let conn = self.open_connection()?;
+        let total: usize = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .map_err(|e| format!("count memories: {e}"))?;
+        let processed: usize = conn
+            .query_row("SELECT COUNT(*) FROM brainwire_refs", [], |row| row.get(0))
+            .map_err(|e| format!("count brainwire_refs: {e}"))?;
+        Ok((total, processed))
+    }
+
+    /// Fetch a batch of unprocessed memories (those not yet in brainwire_refs).
+    /// Returns (id, content, vector_blob, memory_type) tuples ordered oldest first.
+    pub fn fetch_unprocessed_memories(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Vec<u8>, String)>, String> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, m.content, m.vector, m.memory_type
+                 FROM memories m
+                 LEFT JOIN brainwire_refs r ON m.id = r.deepbrain_id
+                 WHERE r.deepbrain_id IS NULL
+                 ORDER BY m.timestamp ASC
+                 LIMIT ?1",
+            )
+            .map_err(|e| format!("prepare unprocessed query: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| format!("query unprocessed: {e}"))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| format!("read row: {e}"))?);
+        }
+        Ok(results)
+    }
+
+    /// Record a successfully bridged memory.
+    pub fn insert_brainwire_ref(
+        &self,
+        deepbrain_id: &str,
+        brainwire_id: &str,
+        gist: Option<&str>,
+        concepts: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.open_connection()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        conn.execute(
+            "INSERT OR REPLACE INTO brainwire_refs (deepbrain_id, brainwire_id, processed_at, gist, concepts)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![deepbrain_id, brainwire_id, now, gist, concepts],
+        )
+        .map_err(|e| format!("insert brainwire_ref: {e}"))?;
         Ok(())
     }
 

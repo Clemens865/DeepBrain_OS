@@ -1,5 +1,6 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useAppStore } from "../store/appStore";
+import { invoke } from "../services/backend";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -52,6 +53,7 @@ export default function DashboardView() {
     llmStatus,
     graphStats,
     compressionStats,
+    brainwireStats,
     verifyResult,
     verifying,
     loadStatus,
@@ -72,6 +74,21 @@ export default function DashboardView() {
   const [bootstrapping, setBootstrapping] = useState(false);
   const [selectedSources, setSelectedSources] = useState<Set<string>>(new Set());
   const [connectorsLoaded, setConnectorsLoaded] = useState(false);
+  const [consolidating, setConsolidating] = useState(false);
+  const [bridgeStatus, setBridgeStatus] = useState<{ total: number; processed: number; remaining: number } | null>(null);
+  const [bridgeImporting, setBridgeImporting] = useState(false);
+  const [bridgeProgress, setBridgeProgress] = useState<{ processed: number; total: number; gist: string } | null>(null);
+
+  const handleConsolidate = useCallback(async () => {
+    setConsolidating(true);
+    try {
+      await invoke("brainwire_consolidate");
+      loadDashboardData();
+    } catch (e) {
+      console.error("Brainwire consolidation failed:", e);
+    }
+    setConsolidating(false);
+  }, [loadDashboardData]);
 
   // Initialize selected sources from connectors once loaded
   useEffect(() => {
@@ -128,17 +145,88 @@ export default function DashboardView() {
     return () => { unlisten?.(); };
   }, []);
 
+  // Load bridge status
+  const loadBridgeStatus = useCallback(() => {
+    invoke<{ total: number; processed: number; remaining: number }>("brainwire_bridge_status")
+      .then(setBridgeStatus)
+      .catch(() => {});
+  }, []);
+
+  const bridgeAbortRef = useRef(false);
+
+  const handleBridgeImport = useCallback(async () => {
+    setBridgeImporting(true);
+    setBridgeProgress(null);
+    bridgeAbortRef.current = false;
+    try {
+      // Loop until all memories are processed or user stops
+      let consecutiveFailures = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        if (bridgeAbortRef.current) break;
+        const result = await invoke<{ processed: number; errors: number; remaining: number }>(
+          "brainwire_bridge_import",
+          { batch_size: 5, limit: 5 }
+        );
+        console.log("[Bridge]", result);
+        if (result.remaining === 0) break;
+        if (result.processed === 0 && result.errors === 0) break; // nothing to do
+        if (result.processed === 0 && result.errors > 0) {
+          consecutiveFailures++;
+          if (consecutiveFailures >= 3) {
+            console.error("Bridge import: 3 consecutive batches with only errors, stopping");
+            break;
+          }
+        } else {
+          consecutiveFailures = 0;
+        }
+      }
+    } catch (e) {
+      console.error("Bridge import failed:", e);
+    }
+    setBridgeImporting(false);
+    loadBridgeStatus();
+    loadDashboardData();
+  }, [loadBridgeStatus, loadDashboardData]);
+
+  const handleBridgeStop = useCallback(() => {
+    bridgeAbortRef.current = true;
+  }, []);
+
+  // Listen for bridge progress events
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        const fn = await listen<{
+          processed: number;
+          total: number;
+          current_id: string;
+          gist: string;
+        }>("brainwire-bridge-progress", (event) => {
+          setBridgeProgress(event.payload);
+        });
+        unlisten = fn;
+      } catch {
+        // Not in Tauri context
+      }
+    })();
+    return () => { unlisten?.(); };
+  }, []);
+
   // Load data on mount and auto-refresh every 10s
   useEffect(() => {
     loadStatus();
     loadDashboardData();
     loadConnectors();
+    loadBridgeStatus();
     const interval = setInterval(() => {
       loadStatus();
       loadDashboardData();
     }, 10000);
     return () => clearInterval(interval);
-  }, [loadStatus, loadDashboardData]);
+  }, [loadStatus, loadDashboardData, loadBridgeStatus]);
 
   return (
     <div className="p-4 space-y-4 overflow-y-auto h-full">
@@ -470,6 +558,105 @@ export default function DashboardView() {
               </div>
               <div className="border-t border-brain-border/50 pt-2 mt-2 text-brain-text/30 text-[10px]">
                 {compressionStats.total_memories} memories scanned
+              </div>
+            </div>
+          ) : (
+            <div className="text-brain-text/30 text-xs">Loading...</div>
+          )}
+        </Panel>
+
+        {/* Brainwire Cognitive Memory Panel */}
+        <Panel title="Brainwire Cognitive Memory">
+          {brainwireStats ? (
+            <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-2">
+                <Stat label="Memories" value={brainwireStats.total_memories} />
+                <Stat label="Active" value={brainwireStats.active_memories} />
+                <Stat label="Concepts" value={brainwireStats.concept_count} />
+                <Stat label="Working Mem" value={brainwireStats.working_memory_items} />
+              </div>
+              <div>
+                <div className="flex justify-between text-[10px] mb-1">
+                  <span className="text-brain-text/40">Avg Salience</span>
+                  <span className="text-brain-text/60">{brainwireStats.avg_salience.toFixed(2)}</span>
+                </div>
+                <div className="h-1.5 bg-brain-bg rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-brain-accent rounded-full transition-all duration-500"
+                    style={{ width: `${Math.min(brainwireStats.avg_salience * 100, 100)}%` }}
+                  />
+                </div>
+              </div>
+              <div className="flex gap-3 border-t border-brain-border/50 pt-2 mt-2">
+                <div className="flex items-center gap-1.5">
+                  <Dot ok={brainwireStats.stm_entries === 0} />
+                  <span className="text-brain-text/40 text-[10px]">
+                    STM: {brainwireStats.stm_entries} pending
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Dot ok={brainwireStats.dormant_memories === 0 || brainwireStats.active_memories > 0} />
+                  <span className="text-brain-text/40 text-[10px]">
+                    {brainwireStats.dormant_memories} dormant
+                  </span>
+                </div>
+              </div>
+              <div className="text-brain-text/30 text-[10px]">
+                {brainwireStats.consolidation_cycles} consolidation cycles
+              </div>
+              <button
+                onClick={handleConsolidate}
+                disabled={consolidating}
+                className="w-full mt-1 px-3 py-1.5 bg-brain-accent/20 text-brain-accent text-[11px] rounded-lg hover:bg-brain-accent/30 transition-colors disabled:opacity-50"
+              >
+                {consolidating ? "Consolidating..." : "Consolidate Now"}
+              </button>
+              {/* Bridge Import */}
+              <div className="border-t border-brain-border/50 pt-2 mt-2">
+                <div className="flex justify-between text-[10px] mb-1.5">
+                  <span className="text-brain-text/40">Bridge Import</span>
+                  {bridgeStatus && (
+                    <span className="text-brain-text/60">
+                      {bridgeStatus.processed} / {bridgeStatus.total} synced
+                    </span>
+                  )}
+                </div>
+                {bridgeStatus && bridgeStatus.remaining > 0 && (
+                  <div className="mb-1.5">
+                    <div className="h-1.5 bg-brain-bg rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-brain-accent rounded-full transition-all duration-500"
+                        style={{ width: `${bridgeStatus.total > 0 ? (bridgeStatus.processed / bridgeStatus.total) * 100 : 0}%` }}
+                      />
+                    </div>
+                    <div className="text-brain-text/30 text-[9px] mt-0.5">
+                      {bridgeStatus.remaining} remaining
+                    </div>
+                  </div>
+                )}
+                {bridgeImporting && bridgeProgress && (
+                  <div className="text-brain-text/40 text-[9px] mb-1.5 truncate">
+                    {bridgeProgress.gist || `Processing...`}
+                  </div>
+                )}
+                {bridgeImporting ? (
+                  <button
+                    onClick={handleBridgeStop}
+                    className="w-full px-3 py-1.5 bg-red-500/20 text-red-400 text-[11px] rounded-lg hover:bg-red-500/30 transition-colors"
+                  >
+                    Stop Import ({bridgeProgress?.processed ?? 0} / {bridgeProgress?.total ?? "?"})
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleBridgeImport}
+                    disabled={bridgeStatus?.remaining === 0}
+                    className="w-full px-3 py-1.5 bg-brain-accent/20 text-brain-accent text-[11px] rounded-lg hover:bg-brain-accent/30 transition-colors disabled:opacity-50"
+                  >
+                    {bridgeStatus?.remaining === 0
+                      ? "All Synced"
+                      : `Start Bridge Import (${bridgeStatus?.remaining ?? "?"} remaining)`}
+                  </button>
+                )}
               </div>
             </div>
           ) : (
